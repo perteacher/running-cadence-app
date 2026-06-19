@@ -331,54 +331,73 @@
       return p;
     }
 
-    const strikes = [];
+    // --- Per-frame signed shin angle at one index (or null if coords missing) ---
+    function shinAt(k, ankleXArr, ankleYArr, kneeXArr, kneeYArr, kneeVisArr) {
+      const ax = ankleXArr && ankleXArr[k], ay = ankleYArr && ankleYArr[k];
+      const kx = kneeXArr  && kneeXArr[k],  ky = kneeYArr  && kneeYArr[k];
+      const hx = hipMidX   && hipMidX[k],   vis = kneeVisArr && kneeVisArr[k];
+      if (!Number.isFinite(ax) || !Number.isFinite(ay) || !Number.isFinite(kx) ||
+          !Number.isFinite(ky) || !Number.isFinite(hx)) return null;
+      const axpx = ax * w, aypx = ay * h, kxpx = kx * w, kypx = ky * h, hxpx = hx * w;
+      // Signed: only the forward component (foot ahead of knee in travel direction) counts.
+      // Propulsion posture (knee ahead of foot) clamps to 0 -- not overstride.
+      const fwd    = Math.max(0, dir * (axpx - kxpx));
+      const shin   = Math.atan2(fwd, Math.abs(aypx - kypx)) * 180 / Math.PI;
+      const offset = dir * (axpx - hxpx);
+      return { shin, offset, vis: Number.isFinite(vis) ? vis : 0 };
+    }
 
-    function addSide(idxArr, ankleXArr, ankleYArr, kneeXArr, kneeYArr, kneeVisArr) {
+    // Each stride -> median of a short touchdown window (td .. td+WIN_AHEAD). A single
+    // frame is hostage to ±1-frame seek jitter and to landing on midstance (shin~0); the
+    // window + per-stride median + across-stride median cancels both.
+    const WIN_AHEAD = 3;
+    const strides = [];
+
+    function addSide(foot, idxArr, ankleXArr, ankleYArr, kneeXArr, kneeYArr, kneeVisArr) {
       const win = strideWin(idxArr);
-      function finiteAt(k) {
-        // Number.isFinite (not global isFinite) so a missing array/coord -> false, not null->0.
-        return Number.isFinite(ankleXArr && ankleXArr[k]) && Number.isFinite(ankleYArr && ankleYArr[k]) &&
-               Number.isFinite(kneeXArr && kneeXArr[k])   && Number.isFinite(kneeYArr && kneeYArr[k]) &&
-               Number.isFinite(hipMidX && hipMidX[k]);
-      }
       for (const p of idxArr) {
-        // Measure at initial contact, not the y-peak; fall back to the peak if IC coords missing.
-        let i = initialContactIdx(ankleYArr, p, win);
-        if (!finiteAt(i)) i = p;
-        const ax = ankleXArr && ankleXArr[i];
-        const ay = ankleYArr && ankleYArr[i];
-        const kx = kneeXArr  && kneeXArr[i];
-        const ky = kneeYArr  && kneeYArr[i];
-        const hx = hipMidX   && hipMidX[i];
-        const vis= kneeVisArr && kneeVisArr[i];
-        if (!isFinite(ax) || !isFinite(ay) || !isFinite(kx) ||
-            !isFinite(ky) || !isFinite(hx) || !(vis >= 0.3)) continue;
-        const axpx = ax * w, aypx = ay * h;
-        const kxpx = kx * w, kypx = ky * h;
-        const hxpx = hx * w;
-        // Signed: only the forward component (foot ahead of knee in travel direction) counts.
-        // Propulsion posture (knee ahead of foot) clamps to 0 -- not overstride.
-        const fwd    = Math.max(0, dir * (axpx - kxpx));
-        const shin   = Math.atan2(fwd, Math.abs(aypx - kypx)) * 180 / Math.PI;
-        const offset = dir * (axpx - hxpx);
-        strikes.push({ shin, offset, vis });
+        const td = initialContactIdx(ankleYArr, p, win);
+        const windowAngles = [];
+        let offSum = 0, offN = 0, visSum = 0, visN = 0;
+        for (let j = td; j <= td + WIN_AHEAD; j++) {
+          const r = shinAt(j, ankleXArr, ankleYArr, kneeXArr, kneeYArr, kneeVisArr);
+          if (r && r.vis >= 0.3) {
+            windowAngles.push(r.shin);
+            offSum += r.offset; offN++;
+            visSum += r.vis;    visN++;
+          }
+        }
+        if (windowAngles.length === 0) continue;
+        const aytd = (ankleYArr && Number.isFinite(ankleYArr[td])) ? Math.round(ankleYArr[td] * 1000) / 1000 : null;
+        strides.push({
+          foot,
+          peakFrame: p,
+          touchdownFrame: td,
+          ankleY_at_td: aytd,
+          windowAngles: windowAngles.map(a => Math.round(a * 10) / 10),
+          strideMedian: Math.round(median(windowAngles) * 10) / 10,
+          offset: offN ? offSum / offN : 0,
+          vis: visN ? visSum / visN : 0
+        });
       }
     }
 
-    addSide(peaks.left,  leftAnkleX,  leftAnkleY,  leftKneeX,  leftKneeY,  leftKneeVis);
-    addSide(peaks.right, rightAnkleX, rightAnkleY, rightKneeX, rightKneeY, rightKneeVis);
+    addSide('L', peaks.left,  leftAnkleX,  leftAnkleY,  leftKneeX,  leftKneeY,  leftKneeVis);
+    addSide('R', peaks.right, rightAnkleX, rightAnkleY, rightKneeX, rightKneeY, rightKneeVis);
 
-    if (strikes.length === 0) {
-      return { shinAngleDeg: null, horizOffset: null, classification: 'unknown', confidence: 'low', strikeCount: 0 };
+    if (strides.length === 0) {
+      return { shinAngleDeg: null, horizOffset: null, classification: 'unknown',
+               confidence: 'low', strikeCount: 0, strideCount: 0,
+               debug: { strides: [], finalMedian: null } };
     }
 
-    const shins   = strikes.map(s => s.shin);
-    const offsets = strikes.map(s => s.offset);
-    const visArr  = strikes.map(s => s.vis);
+    const strideMedians = strides.map(s => s.strideMedian);
+    const offsets       = strides.map(s => s.offset);
+    const visArr        = strides.map(s => s.vis);
 
-    const shinAngleDeg = Math.round(median(shins) * 10) / 10;
+    const shinAngleDeg = Math.round(median(strideMedians) * 10) / 10;
     const horizOffset  = Math.round(median(offsets));
-    const strikeCount  = strikes.length;
+    const strikeCount  = strides.length;
     const avgVis       = visArr.reduce((a, b) => a + b, 0) / visArr.length;
 
     let classification;
@@ -391,7 +410,11 @@
     else if (strikeCount >= 3 && avgVis >= 0.4) confidence = 'medium';
     else                                         confidence = 'low';
 
-    return { shinAngleDeg, horizOffset, classification, confidence, strikeCount };
+    return {
+      shinAngleDeg, horizOffset, classification, confidence,
+      strikeCount, strideCount: strikeCount,
+      debug: { strides, finalMedian: shinAngleDeg }
+    };
   }
 
   const CadenceCore = { computeSPM, computeOverstride, lowpass, detrend, findPeaks, autocorr };
@@ -611,6 +634,84 @@
       const ok = Math.abs(rR.shinAngleDeg - rL.shinAngleDeg) <= 0.2 &&
                  rR.classification === 'overstride' && rL.classification === 'overstride';
       console.log(`${ok ? 'PASS' : 'FAIL'} OSTest-g: R-travel=${rR.shinAngleDeg}(${rR.classification}) L-travel=${rL.shinAngleDeg}(${rL.classification})`);
+    }
+
+    // --- Touchdown window + per-stride median robustness (the real-jitter fix) ---
+    // Realistic foot trajectory: stance plateau domed at midstance (foot lowest, shin~vertical=0),
+    // swing lift, and the foot reaches FORWARD at touchdown -> rotates back through midstance.
+    function genRun(n, fps, period, hipVel, reach) {
+      const s = { leftAnkleY:[], rightAnkleY:[], hipMidY:[], leftVis:[], rightVis:[], tMs:[],
+                  leftAnkleX:[], rightAnkleX:[], leftKneeX:[], leftKneeY:[], rightKneeX:[], rightKneeY:[],
+                  hipMidX:[], leftKneeVis:[], rightKneeVis:[], frameW:1000, frameH:1000 };
+      function ayOf(u){
+        return (u < 0.4) ? (0.86 - 0.03 * Math.pow((u - 0.2)/0.2, 2))   // stance dome, max(lowest foot)@midstance
+                         : (0.83 - 0.30 * Math.sin(Math.PI * (u - 0.4)/0.6)); // swing lift
+      }
+      function fxOf(u){ return (u < 0.4) ? (1 - 2*(u/0.4)) : (-1 + 2*((u-0.4)/0.6)); } // +1 td ->0 mid ->-1 toe-off ->+1
+      for (let i=0;i<n;i++){
+        const t=i/fps; s.tMs.push(t*1000);
+        const hip = 0.20 + hipVel*t;                  // rightward -> dir=+1
+        const uL = (((i/period)+0.0)%1+1)%1, uR = (((i/period)+0.5)%1+1)%1;
+        s.leftAnkleY.push(ayOf(uL));  s.rightAnkleY.push(ayOf(uR));
+        s.leftAnkleX.push(hip + reach*fxOf(uL)); s.rightAnkleX.push(hip + reach*fxOf(uR));
+        s.leftKneeY.push(ayOf(uL) - 0.18);  s.rightKneeY.push(ayOf(uR) - 0.18);
+        s.leftKneeX.push(hip);              s.rightKneeX.push(hip);
+        s.hipMidX.push(hip);               s.hipMidY.push(0.50);
+        s.leftVis.push(1); s.rightVis.push(1); s.leftKneeVis.push(0.9); s.rightKneeVis.push(0.9);
+      }
+      return s;
+    }
+
+    const sampleRun = genRun(300, 30, 20, 0.03, 0.045);
+    const spmRun  = CadenceCore.computeSPM(sampleRun);
+    const overRun = CadenceCore.computeOverstride(sampleRun, spmRun.peaks, { w:1000, h:1000 });
+
+    // (TD-a) touchdown sits on the rising edge, not midstance: every td <= its peak, and the
+    // touchdown-window angle is clearly larger than the raw peak-frame angle (peak ≈ midstance ~0).
+    {
+      const strides = overRun.debug.strides;
+      const tdBeforePeak = strides.length > 0 && strides.every(s => s.touchdownFrame <= s.peakFrame);
+      function rawPeakAngle(s, axA, ayA, kxA, kyA){
+        const k=s.peakFrame;
+        const dx=Math.max(0, (axA[k]-kxA[k])*1000);
+        return Math.atan2(dx, Math.abs((ayA[k]-kyA[k])*1000))*180/Math.PI;
+      }
+      const peakAngles = strides.map(s => s.foot==='L'
+        ? rawPeakAngle(s, sampleRun.leftAnkleX,  sampleRun.leftAnkleY,  sampleRun.leftKneeX,  sampleRun.leftKneeY)
+        : rawPeakAngle(s, sampleRun.rightAnkleX, sampleRun.rightAnkleY, sampleRun.rightKneeX, sampleRun.rightKneeY));
+      const sorted = peakAngles.slice().sort((a,b)=>a-b);
+      const medPeak = sorted.length ? sorted[Math.floor(sorted.length/2)] : 0;
+      const tdWins  = overRun.shinAngleDeg > medPeak + 3;
+      const forward = overRun.shinAngleDeg >= 5 && overRun.shinAngleDeg <= 16;
+      const ok = tdBeforePeak && tdWins && forward;
+      console.log(`${ok ? 'PASS' : 'FAIL'} TD-a: final=${overRun.shinAngleDeg}° vs peakFrame≈${Math.round(medPeak*10)/10}° tdBeforePeak=${tdBeforePeak} strides=${overRun.strideCount}`);
+    }
+
+    // (TD-b) ±1-frame seek jitter: shifting all peak indices by +1/-1 keeps the final within ±2°.
+    {
+      function shiftP(peaks, d){
+        return { left: peaks.left.map(i => Math.max(0, i+d)), right: peaks.right.map(i => Math.max(0, i+d)) };
+      }
+      const a0 = overRun.shinAngleDeg;
+      const aP = CadenceCore.computeOverstride(sampleRun, shiftP(spmRun.peaks, +1), {w:1000,h:1000}).shinAngleDeg;
+      const aM = CadenceCore.computeOverstride(sampleRun, shiftP(spmRun.peaks, -1), {w:1000,h:1000}).shinAngleDeg;
+      const spread = Math.max(a0,aP,aM) - Math.min(a0,aP,aM);
+      const ok = spread <= 2.0;
+      console.log(`${ok ? 'PASS' : 'FAIL'} TD-b: jitter spread=${Math.round(spread*10)/10}° [${a0}, ${aP}, ${aM}]`);
+    }
+
+    // (TD-c) sign: foot ahead of knee -> positive; knee ahead of foot (propulsion) -> 0.
+    {
+      function osArrays(n, obj){ const o={}; for(const k in obj) o[k]=new Array(n).fill(obj[k]); return o; }
+      const idxs=[5,12,19];
+      const ahead  = osArrays(26, { leftAnkleX:0.64, leftAnkleY:0.62, leftKneeX:0.50, leftKneeY:0.42, leftKneeVis:0.9 });
+      ahead.hipMidX=[];  for(let i=0;i<26;i++) ahead.hipMidX.push(0.3+0.01*i);
+      const behind = osArrays(26, { leftAnkleX:0.40, leftAnkleY:0.62, leftKneeX:0.55, leftKneeY:0.42, leftKneeVis:0.9 });
+      behind.hipMidX=[]; for(let i=0;i<26;i++) behind.hipMidX.push(0.3+0.01*i);
+      const rA = CadenceCore.computeOverstride(ahead,  {left:idxs,right:[]}, {w:1000,h:1000});
+      const rB = CadenceCore.computeOverstride(behind, {left:idxs,right:[]}, {w:1000,h:1000});
+      const ok = rA.shinAngleDeg > 5 && rB.shinAngleDeg === 0;
+      console.log(`${ok ? 'PASS' : 'FAIL'} TD-c: foot-ahead=${rA.shinAngleDeg}° knee-ahead=${rB.shinAngleDeg}°`);
     }
   }
 

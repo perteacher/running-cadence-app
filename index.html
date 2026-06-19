@@ -145,6 +145,10 @@
       <div class="verdict" id="overVerdict"></div>
       <p class="hint" id="overCue" style="text-align:center;">발을 엉덩이 아래로 — 무릎 부드럽게, 앞으로 뻗지 마세요.</p>
       <p class="hint" id="overSynergy" style="text-align:center; color:var(--accent);"></p>
+      <details id="overDebug" style="margin-top:12px;">
+        <summary class="hint" style="cursor:pointer; text-align:center; margin:0;">🔧 디버그 — stride별 착지 프레임·각</summary>
+        <pre id="overDebugBody" style="font-size:11px; color:var(--muted); white-space:pre-wrap; word-break:break-word; margin:10px 0 0; line-height:1.55; font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;"></pre>
+      </details>
     </div>
     <div class="warn">⚠️ 케이던스를 올리면 부하가 <b>사라지는 게 아니라</b> 종아리·아킬레스로 <b>옮겨갑니다</b>. 한 번에 5%씩, 몇 주에 걸쳐 천천히 올리세요.</div>
     <div class="stack">
@@ -506,54 +510,73 @@
       return p;
     }
 
-    const strikes = [];
+    // --- Per-frame signed shin angle at one index (or null if coords missing) ---
+    function shinAt(k, ankleXArr, ankleYArr, kneeXArr, kneeYArr, kneeVisArr) {
+      const ax = ankleXArr && ankleXArr[k], ay = ankleYArr && ankleYArr[k];
+      const kx = kneeXArr  && kneeXArr[k],  ky = kneeYArr  && kneeYArr[k];
+      const hx = hipMidX   && hipMidX[k],   vis = kneeVisArr && kneeVisArr[k];
+      if (!Number.isFinite(ax) || !Number.isFinite(ay) || !Number.isFinite(kx) ||
+          !Number.isFinite(ky) || !Number.isFinite(hx)) return null;
+      const axpx = ax * w, aypx = ay * h, kxpx = kx * w, kypx = ky * h, hxpx = hx * w;
+      // Signed: only the forward component (foot ahead of knee in travel direction) counts.
+      // Propulsion posture (knee ahead of foot) clamps to 0 -- not overstride.
+      const fwd    = Math.max(0, dir * (axpx - kxpx));
+      const shin   = Math.atan2(fwd, Math.abs(aypx - kypx)) * 180 / Math.PI;
+      const offset = dir * (axpx - hxpx);
+      return { shin, offset, vis: Number.isFinite(vis) ? vis : 0 };
+    }
 
-    function addSide(idxArr, ankleXArr, ankleYArr, kneeXArr, kneeYArr, kneeVisArr) {
+    // Each stride -> median of a short touchdown window (td .. td+WIN_AHEAD). A single
+    // frame is hostage to ±1-frame seek jitter and to landing on midstance (shin~0); the
+    // window + per-stride median + across-stride median cancels both.
+    const WIN_AHEAD = 3;
+    const strides = [];
+
+    function addSide(foot, idxArr, ankleXArr, ankleYArr, kneeXArr, kneeYArr, kneeVisArr) {
       const win = strideWin(idxArr);
-      function finiteAt(k) {
-        // Number.isFinite (not global isFinite) so a missing array/coord -> false, not null->0.
-        return Number.isFinite(ankleXArr && ankleXArr[k]) && Number.isFinite(ankleYArr && ankleYArr[k]) &&
-               Number.isFinite(kneeXArr && kneeXArr[k])   && Number.isFinite(kneeYArr && kneeYArr[k]) &&
-               Number.isFinite(hipMidX && hipMidX[k]);
-      }
       for (const p of idxArr) {
-        // Measure at initial contact, not the y-peak; fall back to the peak if IC coords missing.
-        let i = initialContactIdx(ankleYArr, p, win);
-        if (!finiteAt(i)) i = p;
-        const ax = ankleXArr && ankleXArr[i];
-        const ay = ankleYArr && ankleYArr[i];
-        const kx = kneeXArr  && kneeXArr[i];
-        const ky = kneeYArr  && kneeYArr[i];
-        const hx = hipMidX   && hipMidX[i];
-        const vis= kneeVisArr && kneeVisArr[i];
-        if (!isFinite(ax) || !isFinite(ay) || !isFinite(kx) ||
-            !isFinite(ky) || !isFinite(hx) || !(vis >= 0.3)) continue;
-        const axpx = ax * w, aypx = ay * h;
-        const kxpx = kx * w, kypx = ky * h;
-        const hxpx = hx * w;
-        // Signed: only the forward component (foot ahead of knee in travel direction) counts.
-        // Propulsion posture (knee ahead of foot) clamps to 0 -- not overstride.
-        const fwd    = Math.max(0, dir * (axpx - kxpx));
-        const shin   = Math.atan2(fwd, Math.abs(aypx - kypx)) * 180 / Math.PI;
-        const offset = dir * (axpx - hxpx);
-        strikes.push({ shin, offset, vis });
+        const td = initialContactIdx(ankleYArr, p, win);
+        const windowAngles = [];
+        let offSum = 0, offN = 0, visSum = 0, visN = 0;
+        for (let j = td; j <= td + WIN_AHEAD; j++) {
+          const r = shinAt(j, ankleXArr, ankleYArr, kneeXArr, kneeYArr, kneeVisArr);
+          if (r && r.vis >= 0.3) {
+            windowAngles.push(r.shin);
+            offSum += r.offset; offN++;
+            visSum += r.vis;    visN++;
+          }
+        }
+        if (windowAngles.length === 0) continue;
+        const aytd = (ankleYArr && Number.isFinite(ankleYArr[td])) ? Math.round(ankleYArr[td] * 1000) / 1000 : null;
+        strides.push({
+          foot,
+          peakFrame: p,
+          touchdownFrame: td,
+          ankleY_at_td: aytd,
+          windowAngles: windowAngles.map(a => Math.round(a * 10) / 10),
+          strideMedian: Math.round(median(windowAngles) * 10) / 10,
+          offset: offN ? offSum / offN : 0,
+          vis: visN ? visSum / visN : 0
+        });
       }
     }
 
-    addSide(peaks.left,  leftAnkleX,  leftAnkleY,  leftKneeX,  leftKneeY,  leftKneeVis);
-    addSide(peaks.right, rightAnkleX, rightAnkleY, rightKneeX, rightKneeY, rightKneeVis);
+    addSide('L', peaks.left,  leftAnkleX,  leftAnkleY,  leftKneeX,  leftKneeY,  leftKneeVis);
+    addSide('R', peaks.right, rightAnkleX, rightAnkleY, rightKneeX, rightKneeY, rightKneeVis);
 
-    if (strikes.length === 0) {
-      return { shinAngleDeg: null, horizOffset: null, classification: 'unknown', confidence: 'low', strikeCount: 0 };
+    if (strides.length === 0) {
+      return { shinAngleDeg: null, horizOffset: null, classification: 'unknown',
+               confidence: 'low', strikeCount: 0, strideCount: 0,
+               debug: { strides: [], finalMedian: null } };
     }
 
-    const shins   = strikes.map(s => s.shin);
-    const offsets = strikes.map(s => s.offset);
-    const visArr  = strikes.map(s => s.vis);
+    const strideMedians = strides.map(s => s.strideMedian);
+    const offsets       = strides.map(s => s.offset);
+    const visArr        = strides.map(s => s.vis);
 
-    const shinAngleDeg = Math.round(median(shins) * 10) / 10;
+    const shinAngleDeg = Math.round(median(strideMedians) * 10) / 10;
     const horizOffset  = Math.round(median(offsets));
-    const strikeCount  = strikes.length;
+    const strikeCount  = strides.length;
     const avgVis       = visArr.reduce((a, b) => a + b, 0) / visArr.length;
 
     let classification;
@@ -566,7 +589,11 @@
     else if (strikeCount >= 3 && avgVis >= 0.4) confidence = 'medium';
     else                                         confidence = 'low';
 
-    return { shinAngleDeg, horizOffset, classification, confidence, strikeCount };
+    return {
+      shinAngleDeg, horizOffset, classification, confidence,
+      strikeCount, strideCount: strikeCount,
+      debug: { strides, finalMedian: shinAngleDeg }
+    };
   }
 
   const CadenceCore = { computeSPM, computeOverstride, lowpass, detrend, findPeaks, autocorr };
@@ -1334,6 +1361,26 @@ async function runCapture(live, maxSec){
 }
 
 /* ---------- Result ---------- */
+// Collapsible on-screen debug: per-stride touchdown frame + window angles + final median.
+// (Phones can't show the console, so dump the overstride diagnostics here.)
+function renderOverDebug(over){
+  var el = $('overDebugBody'); if(!el) return;
+  if(!over || !over.debug || !over.debug.strides || over.debug.strides.length===0){
+    el.textContent = '(stride 데이터 없음 — 무릎/발목 인식 부족)';
+    return;
+  }
+  var lines = over.debug.strides.map(function(s){
+    var ay = (s.ankleY_at_td==null) ? '–' : s.ankleY_at_td;
+    return s.foot+' peak#'+s.peakFrame+' 착지#'+s.touchdownFrame
+         + ' ay='+ay
+         + ' 윈도우[' + s.windowAngles.join(', ') + ']'
+         + ' → ' + s.strideMedian + '°';
+  });
+  lines.push('────────────');
+  lines.push('최종(중앙값): ' + (over.debug.finalMedian==null?'–':over.debug.finalMedian) + '°  ·  stride ' + over.strideCount + '개  ·  진행방향 hipX추세');
+  el.textContent = lines.join('\n');
+}
+
 function showResult(res, over){
   showScreen('result');
   $('spmVal').textContent = res.spm;
@@ -1388,6 +1435,7 @@ function showResult(res, over){
     $('overCue').style.display = 'none';
     $('overSynergy').textContent = '';
   }
+  renderOverDebug(over);
 }
 
 $('btnAgain').addEventListener('click', function(){ showScreen('setup'); });
