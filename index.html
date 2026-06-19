@@ -139,6 +139,13 @@
       <div class="target"><span class="t" id="targetRange">—</span></div>
       <p class="hint" id="targetNote" style="text-align:center;"></p>
     </div>
+    <div class="card" id="overCard">
+      <p class="label" style="text-align:center; margin-bottom:4px;">오버스트라이드 (정강이각)</p>
+      <div class="bignum" style="font-size:48px;"><span id="shinVal">—</span><small>°</small></div>
+      <div class="verdict" id="overVerdict"></div>
+      <p class="hint" id="overCue" style="text-align:center;">발을 엉덩이 아래로 — 무릎 부드럽게, 앞으로 뻗지 마세요.</p>
+      <p class="hint" id="overSynergy" style="text-align:center; color:var(--accent);"></p>
+    </div>
     <div class="warn">⚠️ 케이던스를 올리면 부하가 <b>사라지는 게 아니라</b> 종아리·아킬레스로 <b>옮겨갑니다</b>. 한 번에 5%씩, 몇 주에 걸쳐 천천히 올리세요.</div>
     <div class="stack">
       <button class="btn primary" id="btnPractice">🎵 연습 모드 (메트로놈)</button>
@@ -410,6 +417,7 @@
       stepCount: totalSteps,
       durationSec,
       fps,
+      peaks: { left: leftPeaks, right: rightPeaks },
       debug: {
         fps, spmPeak, spmAuto, combinedCV, leftCV, rightCV,
         leftPeakCount: leftPeaks.length, rightPeakCount: rightPeaks.length,
@@ -419,7 +427,70 @@
     };
   }
 
-  const CadenceCore = { computeSPM, lowpass, detrend, findPeaks, autocorr };
+  // --- Overstride analysis ---
+
+  function computeOverstride(samples, peaks, dims) {
+    const { w, h } = dims;
+    const {
+      leftAnkleX, rightAnkleX,
+      leftAnkleY, rightAnkleY,
+      leftKneeX, leftKneeY,
+      rightKneeX, rightKneeY,
+      hipMidX,
+      leftKneeVis, rightKneeVis
+    } = samples;
+
+    const strikes = [];
+
+    function addSide(idxArr, ankleXArr, ankleYArr, kneeXArr, kneeYArr, kneeVisArr) {
+      for (const i of idxArr) {
+        const ax = ankleXArr && ankleXArr[i];
+        const ay = ankleYArr && ankleYArr[i];
+        const kx = kneeXArr  && kneeXArr[i];
+        const ky = kneeYArr  && kneeYArr[i];
+        const hx = hipMidX   && hipMidX[i];
+        const vis= kneeVisArr && kneeVisArr[i];
+        if (!isFinite(ax) || !isFinite(ay) || !isFinite(kx) ||
+            !isFinite(ky) || !isFinite(hx) || !(vis >= 0.3)) continue;
+        const axpx = ax * w, aypx = ay * h;
+        const kxpx = kx * w, kypx = ky * h;
+        const hxpx = hx * w;
+        const shin   = Math.atan2(Math.abs(axpx - kxpx), Math.abs(aypx - kypx)) * 180 / Math.PI;
+        const offset = axpx - hxpx;
+        strikes.push({ shin, offset, vis });
+      }
+    }
+
+    addSide(peaks.left,  leftAnkleX,  leftAnkleY,  leftKneeX,  leftKneeY,  leftKneeVis);
+    addSide(peaks.right, rightAnkleX, rightAnkleY, rightKneeX, rightKneeY, rightKneeVis);
+
+    if (strikes.length === 0) {
+      return { shinAngleDeg: null, horizOffset: null, classification: 'unknown', confidence: 'low', strikeCount: 0 };
+    }
+
+    const shins   = strikes.map(s => s.shin);
+    const offsets = strikes.map(s => s.offset);
+    const visArr  = strikes.map(s => s.vis);
+
+    const shinAngleDeg = Math.round(median(shins) * 10) / 10;
+    const horizOffset  = Math.round(median(offsets));
+    const strikeCount  = strikes.length;
+    const avgVis       = visArr.reduce((a, b) => a + b, 0) / visArr.length;
+
+    let classification;
+    if (shinAngleDeg < 10)       classification = 'good';
+    else if (shinAngleDeg < 15)  classification = 'borderline';
+    else                         classification = 'overstride';
+
+    let confidence;
+    if (strikeCount >= 4 && avgVis >= 0.6)      confidence = 'high';
+    else if (strikeCount >= 3 && avgVis >= 0.4) confidence = 'medium';
+    else                                         confidence = 'low';
+
+    return { shinAngleDeg, horizOffset, classification, confidence, strikeCount };
+  }
+
+  const CadenceCore = { computeSPM, computeOverstride, lowpass, detrend, findPeaks, autocorr };
 
   // --- Self-test (Node only) ---
   if (typeof require !== 'undefined' && require.main === module) {
@@ -513,6 +584,8 @@
   // MediaPipe landmark indices
   var MP_LEFT_HIP    = 23;
   var MP_RIGHT_HIP   = 24;
+  var MP_LEFT_KNEE   = 25;
+  var MP_RIGHT_KNEE  = 26;
   var MP_LEFT_ANKLE  = 27;
   var MP_RIGHT_ANKLE = 28;
 
@@ -647,6 +720,13 @@
         leftAnkleY: null, rightAnkleY: null,
         hipMidY: null,
         leftVis: null, rightVis: null, hipVis: null,
+        leftAnkleX: null, rightAnkleX: null,
+        leftKneeX: null, leftKneeY: null,
+        rightKneeX: null, rightKneeY: null,
+        hipMidX: null,
+        leftKneeVis: null, rightKneeVis: null,
+        frameW: (videoEl && videoEl.videoWidth)  || 0,
+        frameH: (videoEl && videoEl.videoHeight) || 0,
         ok: false
       };
 
@@ -673,6 +753,13 @@
         leftAnkleY: null, rightAnkleY: null,
         hipMidY: null,
         leftVis: null, rightVis: null, hipVis: null,
+        leftAnkleX: null, rightAnkleX: null,
+        leftKneeX: null, leftKneeY: null,
+        rightKneeX: null, rightKneeY: null,
+        hipMidX: null,
+        leftKneeVis: null, rightKneeVis: null,
+        frameW: (videoEl && videoEl.videoWidth)  || 0,
+        frameH: (videoEl && videoEl.videoHeight) || 0,
         ok: false
       };
 
@@ -704,16 +791,21 @@
         var rightAnkle = lm[MP_RIGHT_ANKLE];
         var leftHip    = lm[MP_LEFT_HIP];
         var rightHip   = lm[MP_RIGHT_HIP];
+        var leftKnee   = lm[MP_LEFT_KNEE];
+        var rightKnee  = lm[MP_RIGHT_KNEE];
 
         var leftHipVis  = (leftHip  && leftHip.visibility  != null) ? leftHip.visibility  : 0;
         var rightHipVis = (rightHip && rightHip.visibility != null) ? rightHip.visibility : 0;
         var leftAnkleVis  = (leftAnkle  && leftAnkle.visibility  != null) ? leftAnkle.visibility  : 0;
         var rightAnkleVis = (rightAnkle && rightAnkle.visibility != null) ? rightAnkle.visibility : 0;
+        var leftKneeVis_  = (leftKnee  && leftKnee.visibility  != null) ? leftKnee.visibility  : 0;
+        var rightKneeVis_ = (rightKnee && rightKnee.visibility != null) ? rightKnee.visibility : 0;
 
         var coreConf = (leftHipVis + rightHipVis + leftAnkleVis + rightAnkleVis) / 4;
 
         var hipX = (leftHip && rightHip) ? (leftHip.x + rightHip.x) / 2 : null;
         var hipY = (leftHip && rightHip) ? (leftHip.y + rightHip.y) / 2 : null;
+        var hipMidX_mp = (leftHip && rightHip) ? (leftHip.x + rightHip.x) / 2 : null;
 
         var fields = {
           leftAnkleY:  leftAnkle  ? leftAnkle.y  : null,
@@ -721,7 +813,18 @@
           hipMidY:     hipY,
           leftVis:     leftAnkleVis,
           rightVis:    rightAnkleVis,
-          hipVis:      Math.min(leftHipVis, rightHipVis)
+          hipVis:      Math.min(leftHipVis, rightHipVis),
+          leftAnkleX:  leftAnkle  ? leftAnkle.x  : null,
+          rightAnkleX: rightAnkle ? rightAnkle.x : null,
+          leftKneeX:   leftKnee   ? leftKnee.x   : null,
+          leftKneeY:   leftKnee   ? leftKnee.y   : null,
+          rightKneeX:  rightKnee  ? rightKnee.x  : null,
+          rightKneeY:  rightKnee  ? rightKnee.y  : null,
+          hipMidX:     hipMidX_mp,
+          leftKneeVis: leftKneeVis_,
+          rightKneeVis: rightKneeVis_,
+          frameW:      videoEl.videoWidth,
+          frameH:      videoEl.videoHeight
         };
 
         candidates.push({
@@ -744,6 +847,17 @@
         leftVis:     chosen.fields.leftVis,
         rightVis:    chosen.fields.rightVis,
         hipVis:      chosen.fields.hipVis,
+        leftAnkleX:  chosen.fields.leftAnkleX,
+        rightAnkleX: chosen.fields.rightAnkleX,
+        leftKneeX:   chosen.fields.leftKneeX,
+        leftKneeY:   chosen.fields.leftKneeY,
+        rightKneeX:  chosen.fields.rightKneeX,
+        rightKneeY:  chosen.fields.rightKneeY,
+        hipMidX:     chosen.fields.hipMidX,
+        leftKneeVis: chosen.fields.leftKneeVis,
+        rightKneeVis: chosen.fields.rightKneeVis,
+        frameW:      chosen.fields.frameW,
+        frameH:      chosen.fields.frameH,
         ok:          ok
       };
     },
@@ -754,6 +868,13 @@
         leftAnkleY: null, rightAnkleY: null,
         hipMidY: null,
         leftVis: null, rightVis: null, hipVis: null,
+        leftAnkleX: null, rightAnkleX: null,
+        leftKneeX: null, leftKneeY: null,
+        rightKneeX: null, rightKneeY: null,
+        hipMidX: null,
+        leftKneeVis: null, rightKneeVis: null,
+        frameW: (videoEl && videoEl.videoWidth)  || 0,
+        frameH: (videoEl && videoEl.videoHeight) || 0,
         ok: false
       };
 
@@ -783,6 +904,8 @@
         var rightAnkleKP = findKP(keypoints, "right_ankle");
         var leftHipKP    = findKP(keypoints, "left_hip");
         var rightHipKP   = findKP(keypoints, "right_hip");
+        var leftKneeKP   = findKP(keypoints, "left_knee");
+        var rightKneeKP  = findKP(keypoints, "right_knee");
 
         // Bounding box area in normalized space
         var minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
@@ -816,13 +939,27 @@
 
         var coreConf = (leftHipVis + rightHipVis + leftAnkleVis + rightAnkleVis) / 4;
 
+        var leftKneeVis_mn  = leftKneeKP  ? (leftKneeKP.score  || 0) : 0;
+        var rightKneeVis_mn = rightKneeKP ? (rightKneeKP.score || 0) : 0;
+
         var fields = {
           leftAnkleY:  leftAnkleY,
           rightAnkleY: rightAnkleY,
           hipMidY:     hipMidY,
           leftVis:     leftAnkleVis,
           rightVis:    rightAnkleVis,
-          hipVis:      Math.min(leftHipVis, rightHipVis)
+          hipVis:      Math.min(leftHipVis, rightHipVis),
+          leftAnkleX:  leftAnkleKP  ? leftAnkleKP.x  / w : null,
+          rightAnkleX: rightAnkleKP ? rightAnkleKP.x / w : null,
+          leftKneeX:   leftKneeKP   ? leftKneeKP.x   / w : null,
+          leftKneeY:   leftKneeKP   ? leftKneeKP.y   / h : null,
+          rightKneeX:  rightKneeKP  ? rightKneeKP.x  / w : null,
+          rightKneeY:  rightKneeKP  ? rightKneeKP.y  / h : null,
+          hipMidX:     hipMidX,
+          leftKneeVis: leftKneeVis_mn,
+          rightKneeVis: rightKneeVis_mn,
+          frameW:      w,
+          frameH:      h
         };
 
         candidates.push({
@@ -845,6 +982,17 @@
         leftVis:     chosen.fields.leftVis,
         rightVis:    chosen.fields.rightVis,
         hipVis:      chosen.fields.hipVis,
+        leftAnkleX:  chosen.fields.leftAnkleX,
+        rightAnkleX: chosen.fields.rightAnkleX,
+        leftKneeX:   chosen.fields.leftKneeX,
+        leftKneeY:   chosen.fields.leftKneeY,
+        rightKneeX:  chosen.fields.rightKneeX,
+        rightKneeY:  chosen.fields.rightKneeY,
+        hipMidX:     chosen.fields.hipMidX,
+        leftKneeVis: chosen.fields.leftKneeVis,
+        rightKneeVis: chosen.fields.rightKneeVis,
+        frameW:      chosen.fields.frameW,
+        frameH:      chosen.fields.frameH,
         ok:          ok
       };
     }
@@ -999,7 +1147,9 @@ async function runCapture(live, maxSec){
     return;
   }
 
-  var S={ leftAnkleY:[], rightAnkleY:[], hipMidY:[], leftVis:[], rightVis:[], tMs:[] };
+  var S={ leftAnkleY:[], rightAnkleY:[], hipMidY:[], leftVis:[], rightVis:[], tMs:[],
+          leftAnkleX:[], rightAnkleX:[], leftKneeX:[], leftKneeY:[], rightKneeX:[], rightKneeY:[],
+          hipMidX:[], leftKneeVis:[], rightKneeVis:[], frameW:0, frameH:0 };
   var okFrames=0, started=false, startT=0, lastTs=-1;
   var useRVFC = ('requestVideoFrameCallback' in HTMLVideoElement.prototype);
 
@@ -1010,6 +1160,16 @@ async function runCapture(live, maxSec){
     S.leftVis.push(s.ok? s.leftVis:0);
     S.rightVis.push(s.ok? s.rightVis:0);
     S.tMs.push(tMs);
+    S.leftAnkleX.push(s.ok? s.leftAnkleX:NaN);
+    S.rightAnkleX.push(s.ok? s.rightAnkleX:NaN);
+    S.leftKneeX.push(s.ok? s.leftKneeX:NaN);
+    S.leftKneeY.push(s.ok? s.leftKneeY:NaN);
+    S.rightKneeX.push(s.ok? s.rightKneeX:NaN);
+    S.rightKneeY.push(s.ok? s.rightKneeY:NaN);
+    S.hipMidX.push(s.ok? s.hipMidX:NaN);
+    S.leftKneeVis.push(s.ok? s.leftKneeVis:0);
+    S.rightKneeVis.push(s.ok? s.rightKneeVis:0);
+    if(s.frameW){ S.frameW=s.frameW; } if(s.frameH){ S.frameH=s.frameH; }
     if(s.ok) okFrames++;
   }
 
@@ -1056,11 +1216,13 @@ async function runCapture(live, maxSec){
   }
   var res = window.CadenceCore.computeSPM(S);
   State.spm = res.spm;
-  showResult(res);
+  var dims = { w: S.frameW || video.videoWidth || 1, h: S.frameH || video.videoHeight || 1 };
+  var over = window.CadenceCore.computeOverstride(S, res.peaks, dims);
+  showResult(res, over);
 }
 
 /* ---------- Result ---------- */
-function showResult(res){
+function showResult(res, over){
   showScreen('result');
   $('spmVal').textContent = res.spm;
   var confMap={high:'신뢰도 높음', medium:'신뢰도 보통', low:'신뢰도 낮음 — 다시 측정 권장'};
@@ -1092,6 +1254,27 @@ function showResult(res){
     ? '낮은 편이니 위 범위를 목표로, 한 번에 5%씩 올려보세요.'
     : '이미 양호합니다. 더 높일 필요는 없어요 — 효율을 시험하고 싶을 때만 +5%.';
   State.targetBpm = lo;
+  // --- overstride (정강이각) ---
+  if(over && over.shinAngleDeg != null && over.classification !== 'unknown'){
+    $('shinVal').textContent = over.shinAngleDeg.toFixed(1);
+    var ovtxt, ovcls;
+    if(over.classification==='good'){ ovtxt='양호 — 발이 몸 아래로 잘 들어옴'; ovcls='ok'; }
+    else if(over.classification==='borderline'){ ovtxt='경계 — 약간 앞쪽 착지'; ovcls='low'; }
+    else { ovtxt='오버스트라이드 — 발이 몸보다 앞에서 착지'; ovcls='low'; }
+    if(over.confidence==='low'){ ovtxt += ' (무릎 인식 약함, 참고용)'; }
+    $('overVerdict').textContent = ovtxt;
+    $('overVerdict').className = 'verdict '+ovcls;
+    $('overCue').style.display = '';
+    if(cls==='low' && over.classification==='overstride'){
+      $('overSynergy').textContent = '💡 케이던스를 올리면 오버스트라이드도 같이 줄어요.';
+    } else { $('overSynergy').textContent = ''; }
+  } else {
+    $('shinVal').textContent = '—';
+    $('overVerdict').textContent = '무릎 인식이 부족해 정강이각을 못 쟀어요 — 측면·전신·밝게 다시 촬영';
+    $('overVerdict').className = 'verdict low';
+    $('overCue').style.display = 'none';
+    $('overSynergy').textContent = '';
+  }
 }
 
 $('btnAgain').addEventListener('click', function(){ showScreen('setup'); });

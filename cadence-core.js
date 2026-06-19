@@ -242,6 +242,7 @@
       stepCount: totalSteps,
       durationSec,
       fps,
+      peaks: { left: leftPeaks, right: rightPeaks },
       debug: {
         fps, spmPeak, spmAuto, combinedCV, leftCV, rightCV,
         leftPeakCount: leftPeaks.length, rightPeakCount: rightPeaks.length,
@@ -251,7 +252,70 @@
     };
   }
 
-  const CadenceCore = { computeSPM, lowpass, detrend, findPeaks, autocorr };
+  // --- Overstride analysis ---
+
+  function computeOverstride(samples, peaks, dims) {
+    const { w, h } = dims;
+    const {
+      leftAnkleX, rightAnkleX,
+      leftAnkleY, rightAnkleY,
+      leftKneeX, leftKneeY,
+      rightKneeX, rightKneeY,
+      hipMidX,
+      leftKneeVis, rightKneeVis
+    } = samples;
+
+    const strikes = [];
+
+    function addSide(idxArr, ankleXArr, ankleYArr, kneeXArr, kneeYArr, kneeVisArr) {
+      for (const i of idxArr) {
+        const ax = ankleXArr && ankleXArr[i];
+        const ay = ankleYArr && ankleYArr[i];
+        const kx = kneeXArr  && kneeXArr[i];
+        const ky = kneeYArr  && kneeYArr[i];
+        const hx = hipMidX   && hipMidX[i];
+        const vis= kneeVisArr && kneeVisArr[i];
+        if (!isFinite(ax) || !isFinite(ay) || !isFinite(kx) ||
+            !isFinite(ky) || !isFinite(hx) || !(vis >= 0.3)) continue;
+        const axpx = ax * w, aypx = ay * h;
+        const kxpx = kx * w, kypx = ky * h;
+        const hxpx = hx * w;
+        const shin   = Math.atan2(Math.abs(axpx - kxpx), Math.abs(aypx - kypx)) * 180 / Math.PI;
+        const offset = axpx - hxpx;
+        strikes.push({ shin, offset, vis });
+      }
+    }
+
+    addSide(peaks.left,  leftAnkleX,  leftAnkleY,  leftKneeX,  leftKneeY,  leftKneeVis);
+    addSide(peaks.right, rightAnkleX, rightAnkleY, rightKneeX, rightKneeY, rightKneeVis);
+
+    if (strikes.length === 0) {
+      return { shinAngleDeg: null, horizOffset: null, classification: 'unknown', confidence: 'low', strikeCount: 0 };
+    }
+
+    const shins   = strikes.map(s => s.shin);
+    const offsets = strikes.map(s => s.offset);
+    const visArr  = strikes.map(s => s.vis);
+
+    const shinAngleDeg = Math.round(median(shins) * 10) / 10;
+    const horizOffset  = Math.round(median(offsets));
+    const strikeCount  = strikes.length;
+    const avgVis       = visArr.reduce((a, b) => a + b, 0) / visArr.length;
+
+    let classification;
+    if (shinAngleDeg < 10)       classification = 'good';
+    else if (shinAngleDeg < 15)  classification = 'borderline';
+    else                         classification = 'overstride';
+
+    let confidence;
+    if (strikeCount >= 4 && avgVis >= 0.6)      confidence = 'high';
+    else if (strikeCount >= 3 && avgVis >= 0.4) confidence = 'medium';
+    else                                         confidence = 'low';
+
+    return { shinAngleDeg, horizOffset, classification, confidence, strikeCount };
+  }
+
+  const CadenceCore = { computeSPM, computeOverstride, lowpass, detrend, findPeaks, autocorr };
 
   // --- Self-test (Node only) ---
   if (typeof require !== 'undefined' && require.main === module) {
@@ -307,6 +371,91 @@
       const r = CadenceCore.computeSPM(t.samples);
       const ok = Math.abs(r.spm - t.expect) <= t.tol;
       console.log(`${ok ? 'PASS' : 'FAIL'} Test${t.label}: got ${r.spm} expected ${t.expect}±${t.tol} method=${r.method} conf=${r.confidence}`);
+    }
+
+    // --- Overstride tests ---
+    function makeOSsamples(n, leftAnkleX, rightAnkleX, leftKneeX, leftKneeY, rightKneeX, rightKneeY, hipMidX, leftAnkleY, rightAnkleY, leftKneeVis, rightKneeVis) {
+      // Build flat arrays of length n filled with constant values
+      function fill(v) { return new Array(n).fill(v); }
+      return {
+        leftAnkleX:   fill(leftAnkleX),
+        rightAnkleX:  fill(rightAnkleX),
+        leftAnkleY:   fill(leftAnkleY),
+        rightAnkleY:  fill(rightAnkleY),
+        leftKneeX:    fill(leftKneeX),
+        leftKneeY:    fill(leftKneeY),
+        rightKneeX:   fill(rightKneeX),
+        rightKneeY:   fill(rightKneeY),
+        hipMidX:      fill(hipMidX),
+        leftKneeVis:  fill(leftKneeVis),
+        rightKneeVis: fill(rightKneeVis),
+      };
+    }
+
+    // (a) Vertical shin: ankle directly below knee (same X), kneeVis 0.9
+    {
+      const idxs = [10, 20, 30, 40];
+      const s = makeOSsamples(50, 0.5, 0.5, 0.5, 0.4, 0.5, 0.4, 0.5, 0.6, 0.6, 0.9, 0.9);
+      const peaks = { left: idxs, right: [] };
+      const r = CadenceCore.computeOverstride(s, peaks, { w: 1000, h: 1000 });
+      const ok = r.shinAngleDeg !== null && Math.abs(r.shinAngleDeg) <= 1 && r.classification === 'good';
+      console.log(`${ok ? 'PASS' : 'FAIL'} OSTest-a: vertical shin shinAngleDeg=${r.shinAngleDeg} class=${r.classification}`);
+    }
+
+    // (b) Known 45 deg: knee(0.5,0.4)->px(500,400), ankle(0.7,0.6)->px(700,600), dx=dy=200 -> 45deg
+    {
+      const idxs = [10, 20, 30, 40];
+      const s = makeOSsamples(50, 0.7, 0.7, 0.5, 0.4, 0.5, 0.4, 0.5, 0.6, 0.6, 0.9, 0.9);
+      const peaks = { left: idxs, right: [] };
+      const r = CadenceCore.computeOverstride(s, peaks, { w: 1000, h: 1000 });
+      const ok = r.shinAngleDeg !== null && Math.abs(r.shinAngleDeg - 45) <= 1 && r.confidence === 'high';
+      console.log(`${ok ? 'PASS' : 'FAIL'} OSTest-b: 45deg shinAngleDeg=${r.shinAngleDeg} conf=${r.confidence}`);
+    }
+
+    // (c) Aspect-ratio correctness: same normalized coords, portrait vs landscape -> DIFFERENT pixel angles
+    {
+      // knee(0.5,0.4) ankle(0.6,0.6) with portrait w=720 h=1280:
+      //   kxpx=360,kypx=512; axpx=432,aypx=768 -> dx=72,dy=256 -> atan2(72,256)
+      // with landscape w=1280 h=720:
+      //   kxpx=640,kypx=288; axpx=768,aypx=432 -> dx=128,dy=144 -> atan2(128,144)
+      const expectedPortrait  = Math.atan2(Math.abs(0.6*720 - 0.5*720), Math.abs(0.6*1280 - 0.4*1280)) * 180 / Math.PI;
+      const expectedLandscape = Math.atan2(Math.abs(0.6*1280 - 0.5*1280), Math.abs(0.6*720 - 0.4*720)) * 180 / Math.PI;
+      const idxs = [5, 10, 15, 20];
+      const s = makeOSsamples(30, 0.6, 0.6, 0.5, 0.4, 0.5, 0.4, 0.5, 0.6, 0.6, 0.9, 0.9);
+      const peaks = { left: idxs, right: [] };
+      const rP = CadenceCore.computeOverstride(s, peaks, { w: 720,  h: 1280 });
+      const rL = CadenceCore.computeOverstride(s, peaks, { w: 1280, h: 720  });
+      const okP = Math.abs(rP.shinAngleDeg - Math.round(expectedPortrait  * 10) / 10) <= 0.15;
+      const okL = Math.abs(rL.shinAngleDeg - Math.round(expectedLandscape * 10) / 10) <= 0.15;
+      const okDiff = Math.abs(rP.shinAngleDeg - rL.shinAngleDeg) > 1; // must differ
+      const ok = okP && okL && okDiff;
+      console.log(`${ok ? 'PASS' : 'FAIL'} OSTest-c: portrait=${rP.shinAngleDeg}(exp≈${Math.round(expectedPortrait*10)/10}) landscape=${rL.shinAngleDeg}(exp≈${Math.round(expectedLandscape*10)/10}) differ=${okDiff}`);
+    }
+
+    // (d) Classification bands: craft normalized coords to yield median ~12 and ~20 degrees pixel-space
+    {
+      // dims 1000x1000 (square, so normalized == pixel proportions).
+      // knee at (0.5, 0.4) -> kxpx=500, kypx=400.
+      // Want ankle shin = angle: atan2(|axpx-kxpx|, |aypx-kypx|) = targetDeg
+      // Fix aypx = 600 -> dypx = 200. Then dxpx = dypx * tan(targetDeg).
+      // ankleX = (kxpx + dxpx) / 1000, ankleY = 600/1000 = 0.6
+      const W = 1000, H = 1000;
+      const kxpx = 500, kypx = 400, aypx = 600;
+      const dypx = aypx - kypx; // 200
+      function ankleXNorm(deg) { return (kxpx + dypx * Math.tan(deg * Math.PI / 180)) / W; }
+      const ax12 = ankleXNorm(12);
+      const ax20 = ankleXNorm(20);
+      const idxs = [5, 10, 15, 20];
+
+      const s12 = makeOSsamples(30, ax12, ax12, 0.5, 0.4, 0.5, 0.4, 0.5, 0.6, 0.6, 0.9, 0.9);
+      const s20 = makeOSsamples(30, ax20, ax20, 0.5, 0.4, 0.5, 0.4, 0.5, 0.6, 0.6, 0.9, 0.9);
+      const peaks = { left: idxs, right: [] };
+      const r12 = CadenceCore.computeOverstride(s12, peaks, { w: W, h: H });
+      const r20 = CadenceCore.computeOverstride(s20, peaks, { w: W, h: H });
+      const ok12 = r12.classification === 'borderline';
+      const ok20 = r20.classification === 'overstride';
+      const ok = ok12 && ok20;
+      console.log(`${ok ? 'PASS' : 'FAIL'} OSTest-d: shin12=${r12.shinAngleDeg}=>${r12.classification} shin20=${r20.shinAngleDeg}=>${r20.classification}`);
     }
   }
 
