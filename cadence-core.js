@@ -291,6 +291,7 @@
       leftKneeX, leftKneeY,
       rightKneeX, rightKneeY,
       hipMidX,
+      leftVis, rightVis,
       leftKneeVis, rightKneeVis
     } = samples;
 
@@ -315,20 +316,23 @@
       return Math.max(4, Math.min(20, Math.round(g * 0.6)));
     }
 
-    // Initial-contact frame: foot is descending (y rising, image y grows down) and just
-    // reaches the contact plateau. Walk back from the y-peak to the 90%-of-rise point.
-    function initialContactIdx(yArr, p, win) {
-      const yPeak = yArr && yArr[p];
-      if (!isFinite(yPeak)) return p;
-      let vMin = yPeak, vIdx = p;
-      for (let i = p; i >= Math.max(0, p - win); i--) {
-        if (isFinite(yArr[i]) && yArr[i] < vMin) { vMin = yArr[i]; vIdx = i; }
+    // Touchdown via velocity zero-crossing: follow the descent (foot falling, y rising) and
+    // stop where it halts -> ground contact. More precise than a fixed % threshold.
+    function touchdownIdx(yArr, p, win) {
+      if (!Number.isFinite(yArr && yArr[p])) return p;
+      const lo = Math.max(1, p - win);
+      let vmaxIdx = lo, vmax = -Infinity;
+      for (let i = lo; i <= p; i++) {
+        if (Number.isFinite(yArr[i]) && Number.isFinite(yArr[i - 1])) {
+          const v = yArr[i] - yArr[i - 1];     // y-down: descending => v>0
+          if (v > vmax) { vmax = v; vmaxIdx = i; }
+        }
       }
-      const thresh = vMin + 0.90 * (yPeak - vMin);
-      for (let i = vIdx; i <= p; i++) {
-        if (isFinite(yArr[i]) && yArr[i] >= thresh) return i;
-      }
-      return p;
+      if (vmax <= 0) return p;                  // no clear descent -> fall back to peak
+      const HALT = 0.25 * vmax;                 // velocity fallen to 25% of peak = contact settled
+      let i = vmaxIdx;
+      while (i < p && Number.isFinite(yArr[i + 1]) && (yArr[i + 1] - yArr[i]) > HALT) i++;
+      return i;
     }
 
     // --- Per-frame signed shin angle at one index (or null if coords missing) ---
@@ -347,21 +351,35 @@
       return { shin, offset, vis: Number.isFinite(vis) ? vis : 0 };
     }
 
-    // Each stride -> median of a short touchdown window (td .. td+WIN_AHEAD). A single
-    // frame is hostage to ±1-frame seek jitter and to landing on midstance (shin~0); the
-    // window + per-stride median + across-stride median cancels both.
-    const WIN_AHEAD = 3;
+    // Overstride is EXPERIMENTAL on 30fps side-view 2D, so gate hard against noise:
+    //  - measure only the NEAR leg (higher ankle+knee visibility); the occluded far leg is dropped
+    //  - per stride: median of a short touchdown window, high-visibility frames only
+    //  - discard shin > 35deg (impossible at contact => swing frame / broken keypoint)
+    const MAX_SHIN = 35, VIS_MIN = 0.5, WIN_AHEAD = 3;
+
+    function sideVis(idxArr, ankleVisArr, kneeVisArr) {
+      let sum = 0, n = 0;
+      for (const p of idxArr) {
+        const av = ankleVisArr && ankleVisArr[p], kv = kneeVisArr && kneeVisArr[p];
+        const parts = [];
+        if (Number.isFinite(av)) parts.push(av);
+        if (Number.isFinite(kv)) parts.push(kv);
+        if (parts.length) { sum += parts.reduce((a, b) => a + b, 0) / parts.length; n++; }
+      }
+      return n ? sum / n : 0;
+    }
+
     const strides = [];
 
     function addSide(foot, idxArr, ankleXArr, ankleYArr, kneeXArr, kneeYArr, kneeVisArr) {
       const win = strideWin(idxArr);
       for (const p of idxArr) {
-        const td = initialContactIdx(ankleYArr, p, win);
+        const td = touchdownIdx(ankleYArr, p, win);
         const windowAngles = [];
         let offSum = 0, offN = 0, visSum = 0, visN = 0;
         for (let j = td; j <= td + WIN_AHEAD; j++) {
           const r = shinAt(j, ankleXArr, ankleYArr, kneeXArr, kneeYArr, kneeVisArr);
-          if (r && r.vis >= 0.3) {
+          if (r && r.vis >= VIS_MIN && r.shin <= MAX_SHIN) {  // high-vis + physically-possible only
             windowAngles.push(r.shin);
             offSum += r.offset; offN++;
             visSum += r.vis;    visN++;
@@ -382,13 +400,17 @@
       }
     }
 
-    addSide('L', peaks.left,  leftAnkleX,  leftAnkleY,  leftKneeX,  leftKneeY,  leftKneeVis);
-    addSide('R', peaks.right, rightAnkleX, rightAnkleY, rightKneeX, rightKneeY, rightKneeVis);
+    // Near leg = the side with higher mean (ankle+knee) visibility across its strides.
+    const leftSideVis  = sideVis(peaks.left,  leftVis,  leftKneeVis);
+    const rightSideVis = sideVis(peaks.right, rightVis, rightKneeVis);
+    const nearFoot = (rightSideVis > leftSideVis) ? 'R' : 'L';
+    if (nearFoot === 'L') addSide('L', peaks.left,  leftAnkleX,  leftAnkleY,  leftKneeX,  leftKneeY,  leftKneeVis);
+    else                  addSide('R', peaks.right, rightAnkleX, rightAnkleY, rightKneeX, rightKneeY, rightKneeVis);
 
     if (strides.length === 0) {
       return { shinAngleDeg: null, horizOffset: null, classification: 'unknown',
-               confidence: 'low', strikeCount: 0, strideCount: 0,
-               debug: { strides: [], finalMedian: null } };
+               confidence: 'low', strikeCount: 0, strideCount: 0, nearFoot,
+               debug: { strides: [], finalMedian: null, nearFoot } };
     }
 
     const strideMedians = strides.map(s => s.strideMedian);
@@ -405,19 +427,71 @@
     else if (shinAngleDeg < 15)  classification = 'borderline';
     else                         classification = 'overstride';
 
+    // Experimental metric: trust only with enough clean strides; too few (<6) -> low.
     let confidence;
-    if (strikeCount >= 4 && avgVis >= 0.6)      confidence = 'high';
-    else if (strikeCount >= 3 && avgVis >= 0.4) confidence = 'medium';
+    if (strikeCount >= 6 && avgVis >= 0.6)      confidence = 'high';
+    else if (strikeCount >= 4 && avgVis >= 0.4) confidence = 'medium';
     else                                         confidence = 'low';
+    if (strikeCount < 6) confidence = 'low';
 
     return {
       shinAngleDeg, horizOffset, classification, confidence,
-      strikeCount, strideCount: strikeCount,
-      debug: { strides, finalMedian: shinAngleDeg }
+      strikeCount, strideCount: strikeCount, nearFoot,
+      debug: { strides, finalMedian: shinAngleDeg, nearFoot }
     };
   }
 
-  const CadenceCore = { computeSPM, computeOverstride, lowpass, detrend, findPeaks, autocorr };
+  // --- Trunk forward lean (shoulder-mid -> hip-mid vs vertical) ---
+  // Reliable on 30fps side-view 2D (large sagittal angle, no contact-frame dependency):
+  // take the MEDIAN over every frame with good shoulder+hip visibility. Deterministic.
+  function computeTrunkLean(samples, dims) {
+    const { w, h } = dims;
+    const { shoulderMidX, shoulderMidY, hipMidX, hipMidY, shoulderVis, hipVis } = samples;
+    const n = (hipMidY && hipMidY.length) || (shoulderMidY && shoulderMidY.length) || 0;
+
+    function meanDiff(arr) {
+      let sum = 0, cnt = 0, prev = null;
+      if (!arr) return 0;
+      for (const v of arr) { if (Number.isFinite(v)) { if (prev !== null) { sum += v - prev; cnt++; } prev = v; } }
+      return cnt > 0 ? sum / cnt : 0;
+    }
+    const dir = meanDiff(hipMidX) < 0 ? -1 : 1;   // forward = travel direction
+
+    const VIS = 0.5;
+    const angles = [];
+    for (let i = 0; i < n; i++) {
+      const sx = shoulderMidX && shoulderMidX[i], sy = shoulderMidY && shoulderMidY[i];
+      const hx = hipMidX && hipMidX[i],           hy = hipMidY && hipMidY[i];
+      const sv = shoulderVis && shoulderVis[i],   hv = hipVis && hipVis[i];
+      if (!Number.isFinite(sx) || !Number.isFinite(sy) || !Number.isFinite(hx) || !Number.isFinite(hy)) continue;
+      if (Number.isFinite(sv) && sv < VIS) continue;
+      if (Number.isFinite(hv) && hv < VIS) continue;
+      // pixel-space shoulder->hip vector; angle from vertical. Sign: + leaning forward (travel dir).
+      const fwd  = dir * (sx - hx) * w;
+      const vert = Math.abs((sy - hy) * h);
+      if (vert < 1) continue;   // skip degenerate frames (shoulder/hip same height) => no ±90° outlier
+      angles.push(Math.atan2(fwd, vert) * 180 / Math.PI);
+    }
+
+    if (angles.length < 3) {
+      return { leanDeg: null, classification: 'unknown', confidence: 'low', frameCount: angles.length };
+    }
+    const leanDeg = Math.round(median(angles) * 10) / 10;
+
+    let classification;
+    if (leanDeg < 2)        classification = 'upright';     // too upright / leaning back
+    else if (leanDeg <= 12) classification = 'good';        // ~2-10 ideal (research), up to 12 ok
+    else                    classification = 'excessive';   // >12 over-lean / hip-flexion
+
+    let confidence;
+    if (angles.length >= 30)      confidence = 'high';
+    else if (angles.length >= 12) confidence = 'medium';
+    else                          confidence = 'low';
+
+    return { leanDeg, classification, confidence, frameCount: angles.length };
+  }
+
+  const CadenceCore = { computeSPM, computeOverstride, computeTrunkLean, lowpass, detrend, findPeaks, autocorr };
 
   // --- Self-test (Node only) ---
   if (typeof require !== 'undefined' && require.main === module) {
@@ -504,14 +578,15 @@
       console.log(`${ok ? 'PASS' : 'FAIL'} OSTest-a: vertical shin shinAngleDeg=${r.shinAngleDeg} class=${r.classification}`);
     }
 
-    // (b) Known 45 deg: knee(0.5,0.4)->px(500,400), ankle(0.7,0.6)->px(700,600), dx=dy=200 -> 45deg
+    // (b) Known 30 deg + enough strides -> high confidence. knee(0.5,0.4), ankle(0.61547,0.6):
+    //     dx=115.47px, dy=200px -> atan2(115.47,200)=30deg. (45deg would now be discarded as >35.)
     {
-      const idxs = [10, 20, 30, 40];
-      const s = makeOSsamples(50, 0.7, 0.7, 0.5, 0.4, 0.5, 0.4, 0.5, 0.6, 0.6, 0.9, 0.9);
+      const idxs = [8, 14, 20, 26, 32, 38];   // 6 strides => 'high' eligible
+      const s = makeOSsamples(44, 0.61547, 0.61547, 0.5, 0.4, 0.5, 0.4, 0.5, 0.6, 0.6, 0.9, 0.9);
       const peaks = { left: idxs, right: [] };
       const r = CadenceCore.computeOverstride(s, peaks, { w: 1000, h: 1000 });
-      const ok = r.shinAngleDeg !== null && Math.abs(r.shinAngleDeg - 45) <= 1 && r.confidence === 'high';
-      console.log(`${ok ? 'PASS' : 'FAIL'} OSTest-b: 45deg shinAngleDeg=${r.shinAngleDeg} conf=${r.confidence}`);
+      const ok = r.shinAngleDeg !== null && Math.abs(r.shinAngleDeg - 30) <= 1 && r.confidence === 'high';
+      console.log(`${ok ? 'PASS' : 'FAIL'} OSTest-b: 30deg shinAngleDeg=${r.shinAngleDeg} conf=${r.confidence} strides=${r.strideCount}`);
     }
 
     // (c) Aspect-ratio correctness: same normalized coords, portrait vs landscape -> DIFFERENT pixel angles
@@ -520,10 +595,10 @@
       //   kxpx=360,kypx=512; axpx=432,aypx=768 -> dx=72,dy=256 -> atan2(72,256)
       // with landscape w=1280 h=720:
       //   kxpx=640,kypx=288; axpx=768,aypx=432 -> dx=128,dy=144 -> atan2(128,144)
-      const expectedPortrait  = Math.atan2(Math.abs(0.6*720 - 0.5*720), Math.abs(0.6*1280 - 0.4*1280)) * 180 / Math.PI;
-      const expectedLandscape = Math.atan2(Math.abs(0.6*1280 - 0.5*1280), Math.abs(0.6*720 - 0.4*720)) * 180 / Math.PI;
+      const expectedPortrait  = Math.atan2(Math.abs(0.55*720 - 0.5*720), Math.abs(0.6*1280 - 0.4*1280)) * 180 / Math.PI;
+      const expectedLandscape = Math.atan2(Math.abs(0.55*1280 - 0.5*1280), Math.abs(0.6*720 - 0.4*720)) * 180 / Math.PI;
       const idxs = [5, 10, 15, 20];
-      const s = makeOSsamples(30, 0.6, 0.6, 0.5, 0.4, 0.5, 0.4, 0.5, 0.6, 0.6, 0.9, 0.9);
+      const s = makeOSsamples(30, 0.55, 0.55, 0.5, 0.4, 0.5, 0.4, 0.5, 0.6, 0.6, 0.9, 0.9);
       const peaks = { left: idxs, right: [] };
       const rP = CadenceCore.computeOverstride(s, peaks, { w: 720,  h: 1280 });
       const rL = CadenceCore.computeOverstride(s, peaks, { w: 1280, h: 720  });
@@ -617,14 +692,14 @@
     // (g) Direction-agnostic: foot-ahead overstride detected for BOTH L->R and R->L travel.
     {
       const n = 30, idxs = [5, 12, 19, 26];
-      const sR = osArrays(n, {              // rightward: dir=+1, foot ahead => ankleX > kneeX
-        leftAnkleX: 0.70, rightAnkleX: 0.70, leftAnkleY: 0.62, rightAnkleY: 0.62,
+      const sR = osArrays(n, {              // rightward: dir=+1, foot ahead => ankleX > kneeX (30deg)
+        leftAnkleX: 0.61547, rightAnkleX: 0.61547, leftAnkleY: 0.62, rightAnkleY: 0.62,
         leftKneeX: 0.50, leftKneeY: 0.42, rightKneeX: 0.50, rightKneeY: 0.42,
         leftKneeVis: 0.9, rightKneeVis: 0.9
       });
       sR.hipMidX = []; for (let i = 0; i < n; i++) sR.hipMidX.push(0.20 + 0.01 * i);
-      const sL = osArrays(n, {              // leftward: dir=-1, foot ahead => ankleX < kneeX (mirror)
-        leftAnkleX: 0.30, rightAnkleX: 0.30, leftAnkleY: 0.62, rightAnkleY: 0.62,
+      const sL = osArrays(n, {              // leftward: dir=-1, foot ahead => ankleX < kneeX (mirror, 30deg)
+        leftAnkleX: 0.38453, rightAnkleX: 0.38453, leftAnkleY: 0.62, rightAnkleY: 0.62,
         leftKneeX: 0.50, leftKneeY: 0.42, rightKneeX: 0.50, rightKneeY: 0.42,
         leftKneeVis: 0.9, rightKneeVis: 0.9
       });
@@ -704,7 +779,7 @@
     {
       function osArrays(n, obj){ const o={}; for(const k in obj) o[k]=new Array(n).fill(obj[k]); return o; }
       const idxs=[5,12,19];
-      const ahead  = osArrays(26, { leftAnkleX:0.64, leftAnkleY:0.62, leftKneeX:0.50, leftKneeY:0.42, leftKneeVis:0.9 });
+      const ahead  = osArrays(26, { leftAnkleX:0.62, leftAnkleY:0.62, leftKneeX:0.50, leftKneeY:0.42, leftKneeVis:0.9 });
       ahead.hipMidX=[];  for(let i=0;i<26;i++) ahead.hipMidX.push(0.3+0.01*i);
       const behind = osArrays(26, { leftAnkleX:0.40, leftAnkleY:0.62, leftKneeX:0.55, leftKneeY:0.42, leftKneeVis:0.9 });
       behind.hipMidX=[]; for(let i=0;i<26;i++) behind.hipMidX.push(0.3+0.01*i);
@@ -712,6 +787,87 @@
       const rB = CadenceCore.computeOverstride(behind, {left:idxs,right:[]}, {w:1000,h:1000});
       const ok = rA.shinAngleDeg > 5 && rB.shinAngleDeg === 0;
       console.log(`${ok ? 'PASS' : 'FAIL'} TD-c: foot-ahead=${rA.shinAngleDeg}° knee-ahead=${rB.shinAngleDeg}°`);
+    }
+
+    // --- Overstride gating (demotion to experimental) ---
+    function osFill(n, obj){ const o={}; for(const k in obj) o[k]=new Array(n).fill(obj[k]); return o; }
+
+    // (GATE-discard) shin > 35deg is physically impossible at contact => discarded => 'unknown'.
+    {
+      // knee(0.5,0.4), ankle(0.8,0.62) -> dx=300,dy=200 -> atan2(300,200)=56.3deg (>35).
+      const s = osFill(30, { leftAnkleX:0.80, leftAnkleY:0.62, leftKneeX:0.50, leftKneeY:0.42,
+                             leftKneeVis:0.9, leftVis:0.9, hipMidX:0.5 });
+      const r = CadenceCore.computeOverstride(s, { left:[5,12,19,26], right:[] }, { w:1000, h:1000 });
+      const ok = r.classification === 'unknown' && r.shinAngleDeg === null;
+      console.log(`${ok ? 'PASS' : 'FAIL'} GATE-discard: >35deg dropped -> class=${r.classification} shin=${r.shinAngleDeg}`);
+    }
+
+    // (GATE-lowconf) fewer than 6 valid strides -> confidence forced to 'low'.
+    {
+      // 20deg overstride, only 4 strides.
+      const ax = (500 + 200*Math.tan(20*Math.PI/180))/1000;   // ~0.5728
+      const s = osFill(30, { leftAnkleX:ax, leftAnkleY:0.60, leftKneeX:0.50, leftKneeY:0.40,
+                             leftKneeVis:0.9, leftVis:0.9, hipMidX:0.5 });
+      const r = CadenceCore.computeOverstride(s, { left:[5,12,19,26], right:[] }, { w:1000, h:1000 });
+      const ok = r.confidence === 'low' && r.classification !== 'unknown' && r.strideCount < 6;
+      console.log(`${ok ? 'PASS' : 'FAIL'} GATE-lowconf: strides=${r.strideCount} conf=${r.confidence} class=${r.classification}`);
+    }
+
+    // (GATE-nearleg) occluded far leg (low vis) excluded; the near (high-vis) leg is measured.
+    {
+      const n=30;
+      const s = osFill(n, {
+        leftAnkleX:0.62,  leftAnkleY:0.62,  leftKneeX:0.50,  leftKneeY:0.42,  leftKneeVis:0.15, leftVis:0.15,
+        rightAnkleX:0.62, rightAnkleY:0.62, rightKneeX:0.50, rightKneeY:0.42, rightKneeVis:0.9, rightVis:0.9
+      });
+      s.hipMidX=[]; for(let i=0;i<n;i++) s.hipMidX.push(0.30+0.01*i);
+      const r = CadenceCore.computeOverstride(s, { left:[5,12,19,26], right:[5,12,19,26] }, { w:1000, h:1000 });
+      const ok = r.nearFoot === 'R' && r.classification !== 'unknown';
+      console.log(`${ok ? 'PASS' : 'FAIL'} GATE-nearleg: nearFoot=${r.nearFoot} (far L vis 0.15 dropped) shin=${r.shinAngleDeg}`);
+    }
+
+    // --- Trunk forward lean (reliable metric) ---
+    function trunkSample(n, dirSign, shoulderXoff, shoulderY) {
+      const s = { shoulderMidX:[], shoulderMidY:[], hipMidX:[], hipMidY:[], shoulderVis:[], hipVis:[] };
+      for (let i=0;i<n;i++){
+        const hipx = dirSign >= 0 ? (0.30 + 0.005*i) : (0.80 - 0.005*i);  // +1 rightward, -1 leftward
+        s.hipMidX.push(hipx); s.hipMidY.push(0.60);
+        s.shoulderMidX.push(hipx + shoulderXoff);
+        s.shoulderMidY.push(shoulderY);
+        s.shoulderVis.push(0.9); s.hipVis.push(0.9);
+      }
+      return s;
+    }
+
+    // (TL-a) known 5deg forward lean: shoulder 17.5px ahead, 200px above -> atan2(17.5,200)=5deg.
+    {
+      const s = trunkSample(40, +1, 0.0175, 0.40);
+      const r = CadenceCore.computeTrunkLean(s, { w:1000, h:1000 });
+      const ok = r.leanDeg !== null && Math.abs(r.leanDeg - 5) <= 0.5 && r.classification === 'good' && r.confidence === 'high';
+      console.log(`${ok ? 'PASS' : 'FAIL'} TL-a: leanDeg=${r.leanDeg}° class=${r.classification} conf=${r.confidence} frames=${r.frameCount}`);
+    }
+
+    // (TL-b) aspect-ratio correctness: same normalized coords, portrait vs landscape -> different angle.
+    {
+      const s = trunkSample(40, +1, 0.03, 0.40);
+      const rP = CadenceCore.computeTrunkLean(s, { w:720,  h:1280 });
+      const rL = CadenceCore.computeTrunkLean(s, { w:1280, h:720  });
+      const expP = Math.atan2(0.03*720, 0.20*1280) * 180/Math.PI;   // ~4.8
+      const expL = Math.atan2(0.03*1280, 0.20*720) * 180/Math.PI;   // ~14.9
+      const ok = Math.abs(rP.leanDeg - Math.round(expP*10)/10) <= 0.2 &&
+                 Math.abs(rL.leanDeg - Math.round(expL*10)/10) <= 0.2 &&
+                 Math.abs(rP.leanDeg - rL.leanDeg) > 1;
+      console.log(`${ok ? 'PASS' : 'FAIL'} TL-b: portrait=${rP.leanDeg}(exp≈${Math.round(expP*10)/10}) landscape=${rL.leanDeg}(exp≈${Math.round(expL*10)/10})`);
+    }
+
+    // (TL-c) sign: shoulders ahead in travel dir -> + (both L->R and R->L); shoulders behind -> -.
+    {
+      const fwdR = CadenceCore.computeTrunkLean(trunkSample(40, +1, +0.03, 0.40), { w:1000, h:1000 }); // rightward, ahead
+      const fwdL = CadenceCore.computeTrunkLean(trunkSample(40, -1, -0.03, 0.40), { w:1000, h:1000 }); // leftward, ahead (mirror)
+      const back = CadenceCore.computeTrunkLean(trunkSample(40, +1, -0.03, 0.40), { w:1000, h:1000 }); // rightward, behind
+      const ok = fwdR.leanDeg > 0 && fwdL.leanDeg > 0 &&
+                 Math.abs(fwdR.leanDeg - fwdL.leanDeg) <= 0.2 && back.leanDeg < 0;
+      console.log(`${ok ? 'PASS' : 'FAIL'} TL-c: fwdR=${fwdR.leanDeg}° fwdL=${fwdL.leanDeg}° back=${back.leanDeg}°`);
     }
   }
 

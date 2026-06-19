@@ -57,6 +57,9 @@
     border:1px solid var(--line); border-radius:20px; padding:4px 11px; margin:0 auto;}
   .target{text-align:center; margin-top:6px;}
   .target .t{font-size:30px; font-weight:800; color:var(--accent);}
+  .tag{display:inline-block; font-size:10.5px; font-weight:700; padding:2px 7px; border-radius:6px; vertical-align:middle; margin-left:6px; letter-spacing:.2px;}
+  .tag.exp{background:rgba(245,158,11,.16); color:var(--accent2); border:1px solid rgba(245,158,11,.42);}
+  .tag.rel{background:rgba(45,212,191,.14); color:var(--accent); border:1px solid rgba(45,212,191,.42);}
   .warn{background:rgba(248,113,113,.09); border:1px solid rgba(248,113,113,.35); color:#fca5a5;
     border-radius:12px; padding:13px 14px; font-size:13px; line-height:1.6;}
   .disclaimer{font-size:11.5px; color:#6b7785; line-height:1.6; text-align:center; margin-top:4px;}
@@ -139,8 +142,15 @@
       <div class="target"><span class="t" id="targetRange">—</span></div>
       <p class="hint" id="targetNote" style="text-align:center;"></p>
     </div>
+    <div class="card" id="trunkCard">
+      <p class="label" style="text-align:center; margin-bottom:4px;">상체 전경각 (어깨–엉덩이) <span class="tag rel">신뢰</span></p>
+      <div class="bignum" style="font-size:48px;"><span id="trunkVal">—</span><small>°</small></div>
+      <div class="verdict" id="trunkVerdict"></div>
+      <p class="hint" id="trunkCue" style="text-align:center;">발목부터 몸 전체로 살짝 앞으로 — 허리만 굽히지 마세요.</p>
+      <p class="hint" id="trunkNote" style="text-align:center; font-size:11px; color:#6b7785;">※ 카메라가 수평·정측면일 때 정확합니다. 기울면 값이 편향돼요.</p>
+    </div>
     <div class="card" id="overCard">
-      <p class="label" style="text-align:center; margin-bottom:4px;">오버스트라이드 (정강이각)</p>
+      <p class="label" style="text-align:center; margin-bottom:4px;">오버스트라이드 (정강이각) <span class="tag exp">참고·실험적</span></p>
       <div class="bignum" style="font-size:48px;"><span id="shinVal">—</span><small>°</small></div>
       <div class="verdict" id="overVerdict"></div>
       <p class="hint" id="overCue" style="text-align:center;">발을 엉덩이 아래로 — 무릎 부드럽게, 앞으로 뻗지 마세요.</p>
@@ -470,6 +480,7 @@
       leftKneeX, leftKneeY,
       rightKneeX, rightKneeY,
       hipMidX,
+      leftVis, rightVis,
       leftKneeVis, rightKneeVis
     } = samples;
 
@@ -494,20 +505,23 @@
       return Math.max(4, Math.min(20, Math.round(g * 0.6)));
     }
 
-    // Initial-contact frame: foot is descending (y rising, image y grows down) and just
-    // reaches the contact plateau. Walk back from the y-peak to the 90%-of-rise point.
-    function initialContactIdx(yArr, p, win) {
-      const yPeak = yArr && yArr[p];
-      if (!isFinite(yPeak)) return p;
-      let vMin = yPeak, vIdx = p;
-      for (let i = p; i >= Math.max(0, p - win); i--) {
-        if (isFinite(yArr[i]) && yArr[i] < vMin) { vMin = yArr[i]; vIdx = i; }
+    // Touchdown via velocity zero-crossing: follow the descent (foot falling, y rising) and
+    // stop where it halts -> ground contact. More precise than a fixed % threshold.
+    function touchdownIdx(yArr, p, win) {
+      if (!Number.isFinite(yArr && yArr[p])) return p;
+      const lo = Math.max(1, p - win);
+      let vmaxIdx = lo, vmax = -Infinity;
+      for (let i = lo; i <= p; i++) {
+        if (Number.isFinite(yArr[i]) && Number.isFinite(yArr[i - 1])) {
+          const v = yArr[i] - yArr[i - 1];     // y-down: descending => v>0
+          if (v > vmax) { vmax = v; vmaxIdx = i; }
+        }
       }
-      const thresh = vMin + 0.90 * (yPeak - vMin);
-      for (let i = vIdx; i <= p; i++) {
-        if (isFinite(yArr[i]) && yArr[i] >= thresh) return i;
-      }
-      return p;
+      if (vmax <= 0) return p;                  // no clear descent -> fall back to peak
+      const HALT = 0.25 * vmax;                 // velocity fallen to 25% of peak = contact settled
+      let i = vmaxIdx;
+      while (i < p && Number.isFinite(yArr[i + 1]) && (yArr[i + 1] - yArr[i]) > HALT) i++;
+      return i;
     }
 
     // --- Per-frame signed shin angle at one index (or null if coords missing) ---
@@ -526,21 +540,35 @@
       return { shin, offset, vis: Number.isFinite(vis) ? vis : 0 };
     }
 
-    // Each stride -> median of a short touchdown window (td .. td+WIN_AHEAD). A single
-    // frame is hostage to ±1-frame seek jitter and to landing on midstance (shin~0); the
-    // window + per-stride median + across-stride median cancels both.
-    const WIN_AHEAD = 3;
+    // Overstride is EXPERIMENTAL on 30fps side-view 2D, so gate hard against noise:
+    //  - measure only the NEAR leg (higher ankle+knee visibility); the occluded far leg is dropped
+    //  - per stride: median of a short touchdown window, high-visibility frames only
+    //  - discard shin > 35deg (impossible at contact => swing frame / broken keypoint)
+    const MAX_SHIN = 35, VIS_MIN = 0.5, WIN_AHEAD = 3;
+
+    function sideVis(idxArr, ankleVisArr, kneeVisArr) {
+      let sum = 0, n = 0;
+      for (const p of idxArr) {
+        const av = ankleVisArr && ankleVisArr[p], kv = kneeVisArr && kneeVisArr[p];
+        const parts = [];
+        if (Number.isFinite(av)) parts.push(av);
+        if (Number.isFinite(kv)) parts.push(kv);
+        if (parts.length) { sum += parts.reduce((a, b) => a + b, 0) / parts.length; n++; }
+      }
+      return n ? sum / n : 0;
+    }
+
     const strides = [];
 
     function addSide(foot, idxArr, ankleXArr, ankleYArr, kneeXArr, kneeYArr, kneeVisArr) {
       const win = strideWin(idxArr);
       for (const p of idxArr) {
-        const td = initialContactIdx(ankleYArr, p, win);
+        const td = touchdownIdx(ankleYArr, p, win);
         const windowAngles = [];
         let offSum = 0, offN = 0, visSum = 0, visN = 0;
         for (let j = td; j <= td + WIN_AHEAD; j++) {
           const r = shinAt(j, ankleXArr, ankleYArr, kneeXArr, kneeYArr, kneeVisArr);
-          if (r && r.vis >= 0.3) {
+          if (r && r.vis >= VIS_MIN && r.shin <= MAX_SHIN) {  // high-vis + physically-possible only
             windowAngles.push(r.shin);
             offSum += r.offset; offN++;
             visSum += r.vis;    visN++;
@@ -561,13 +589,17 @@
       }
     }
 
-    addSide('L', peaks.left,  leftAnkleX,  leftAnkleY,  leftKneeX,  leftKneeY,  leftKneeVis);
-    addSide('R', peaks.right, rightAnkleX, rightAnkleY, rightKneeX, rightKneeY, rightKneeVis);
+    // Near leg = the side with higher mean (ankle+knee) visibility across its strides.
+    const leftSideVis  = sideVis(peaks.left,  leftVis,  leftKneeVis);
+    const rightSideVis = sideVis(peaks.right, rightVis, rightKneeVis);
+    const nearFoot = (rightSideVis > leftSideVis) ? 'R' : 'L';
+    if (nearFoot === 'L') addSide('L', peaks.left,  leftAnkleX,  leftAnkleY,  leftKneeX,  leftKneeY,  leftKneeVis);
+    else                  addSide('R', peaks.right, rightAnkleX, rightAnkleY, rightKneeX, rightKneeY, rightKneeVis);
 
     if (strides.length === 0) {
       return { shinAngleDeg: null, horizOffset: null, classification: 'unknown',
-               confidence: 'low', strikeCount: 0, strideCount: 0,
-               debug: { strides: [], finalMedian: null } };
+               confidence: 'low', strikeCount: 0, strideCount: 0, nearFoot,
+               debug: { strides: [], finalMedian: null, nearFoot } };
     }
 
     const strideMedians = strides.map(s => s.strideMedian);
@@ -584,19 +616,71 @@
     else if (shinAngleDeg < 15)  classification = 'borderline';
     else                         classification = 'overstride';
 
+    // Experimental metric: trust only with enough clean strides; too few (<6) -> low.
     let confidence;
-    if (strikeCount >= 4 && avgVis >= 0.6)      confidence = 'high';
-    else if (strikeCount >= 3 && avgVis >= 0.4) confidence = 'medium';
+    if (strikeCount >= 6 && avgVis >= 0.6)      confidence = 'high';
+    else if (strikeCount >= 4 && avgVis >= 0.4) confidence = 'medium';
     else                                         confidence = 'low';
+    if (strikeCount < 6) confidence = 'low';
 
     return {
       shinAngleDeg, horizOffset, classification, confidence,
-      strikeCount, strideCount: strikeCount,
-      debug: { strides, finalMedian: shinAngleDeg }
+      strikeCount, strideCount: strikeCount, nearFoot,
+      debug: { strides, finalMedian: shinAngleDeg, nearFoot }
     };
   }
 
-  const CadenceCore = { computeSPM, computeOverstride, lowpass, detrend, findPeaks, autocorr };
+  // --- Trunk forward lean (shoulder-mid -> hip-mid vs vertical) ---
+  // Reliable on 30fps side-view 2D (large sagittal angle, no contact-frame dependency):
+  // take the MEDIAN over every frame with good shoulder+hip visibility. Deterministic.
+  function computeTrunkLean(samples, dims) {
+    const { w, h } = dims;
+    const { shoulderMidX, shoulderMidY, hipMidX, hipMidY, shoulderVis, hipVis } = samples;
+    const n = (hipMidY && hipMidY.length) || (shoulderMidY && shoulderMidY.length) || 0;
+
+    function meanDiff(arr) {
+      let sum = 0, cnt = 0, prev = null;
+      if (!arr) return 0;
+      for (const v of arr) { if (Number.isFinite(v)) { if (prev !== null) { sum += v - prev; cnt++; } prev = v; } }
+      return cnt > 0 ? sum / cnt : 0;
+    }
+    const dir = meanDiff(hipMidX) < 0 ? -1 : 1;   // forward = travel direction
+
+    const VIS = 0.5;
+    const angles = [];
+    for (let i = 0; i < n; i++) {
+      const sx = shoulderMidX && shoulderMidX[i], sy = shoulderMidY && shoulderMidY[i];
+      const hx = hipMidX && hipMidX[i],           hy = hipMidY && hipMidY[i];
+      const sv = shoulderVis && shoulderVis[i],   hv = hipVis && hipVis[i];
+      if (!Number.isFinite(sx) || !Number.isFinite(sy) || !Number.isFinite(hx) || !Number.isFinite(hy)) continue;
+      if (Number.isFinite(sv) && sv < VIS) continue;
+      if (Number.isFinite(hv) && hv < VIS) continue;
+      // pixel-space shoulder->hip vector; angle from vertical. Sign: + leaning forward (travel dir).
+      const fwd  = dir * (sx - hx) * w;
+      const vert = Math.abs((sy - hy) * h);
+      if (vert < 1) continue;   // skip degenerate frames (shoulder/hip same height) => no ±90° outlier
+      angles.push(Math.atan2(fwd, vert) * 180 / Math.PI);
+    }
+
+    if (angles.length < 3) {
+      return { leanDeg: null, classification: 'unknown', confidence: 'low', frameCount: angles.length };
+    }
+    const leanDeg = Math.round(median(angles) * 10) / 10;
+
+    let classification;
+    if (leanDeg < 2)        classification = 'upright';     // too upright / leaning back
+    else if (leanDeg <= 12) classification = 'good';        // ~2-10 ideal (research), up to 12 ok
+    else                    classification = 'excessive';   // >12 over-lean / hip-flexion
+
+    let confidence;
+    if (angles.length >= 30)      confidence = 'high';
+    else if (angles.length >= 12) confidence = 'medium';
+    else                          confidence = 'low';
+
+    return { leanDeg, classification, confidence, frameCount: angles.length };
+  }
+
+  const CadenceCore = { computeSPM, computeOverstride, computeTrunkLean, lowpass, detrend, findPeaks, autocorr };
 
   // --- Self-test (Node only) ---
   if (typeof require !== 'undefined' && require.main === module) {
@@ -688,6 +772,8 @@
   "use strict";
 
   // MediaPipe landmark indices
+  var MP_LEFT_SHOULDER  = 11;
+  var MP_RIGHT_SHOULDER = 12;
   var MP_LEFT_HIP    = 23;
   var MP_RIGHT_HIP   = 24;
   var MP_LEFT_KNEE   = 25;
@@ -830,6 +916,7 @@
         leftKneeX: null, leftKneeY: null,
         rightKneeX: null, rightKneeY: null,
         hipMidX: null,
+        shoulderMidX: null, shoulderMidY: null, shoulderVis: null,
         leftKneeVis: null, rightKneeVis: null,
         frameW: (videoEl && videoEl.videoWidth)  || 0,
         frameH: (videoEl && videoEl.videoHeight) || 0,
@@ -863,6 +950,7 @@
         leftKneeX: null, leftKneeY: null,
         rightKneeX: null, rightKneeY: null,
         hipMidX: null,
+        shoulderMidX: null, shoulderMidY: null, shoulderVis: null,
         leftKneeVis: null, rightKneeVis: null,
         frameW: (videoEl && videoEl.videoWidth)  || 0,
         frameH: (videoEl && videoEl.videoHeight) || 0,
@@ -899,6 +987,8 @@
         var rightHip   = lm[MP_RIGHT_HIP];
         var leftKnee   = lm[MP_LEFT_KNEE];
         var rightKnee  = lm[MP_RIGHT_KNEE];
+        var leftShoulder  = lm[MP_LEFT_SHOULDER];
+        var rightShoulder = lm[MP_RIGHT_SHOULDER];
 
         var leftHipVis  = (leftHip  && leftHip.visibility  != null) ? leftHip.visibility  : 0;
         var rightHipVis = (rightHip && rightHip.visibility != null) ? rightHip.visibility : 0;
@@ -906,12 +996,16 @@
         var rightAnkleVis = (rightAnkle && rightAnkle.visibility != null) ? rightAnkle.visibility : 0;
         var leftKneeVis_  = (leftKnee  && leftKnee.visibility  != null) ? leftKnee.visibility  : 0;
         var rightKneeVis_ = (rightKnee && rightKnee.visibility != null) ? rightKnee.visibility : 0;
+        var leftShoulderVis  = (leftShoulder  && leftShoulder.visibility  != null) ? leftShoulder.visibility  : 0;
+        var rightShoulderVis = (rightShoulder && rightShoulder.visibility != null) ? rightShoulder.visibility : 0;
 
         var coreConf = (leftHipVis + rightHipVis + leftAnkleVis + rightAnkleVis) / 4;
 
         var hipX = (leftHip && rightHip) ? (leftHip.x + rightHip.x) / 2 : null;
         var hipY = (leftHip && rightHip) ? (leftHip.y + rightHip.y) / 2 : null;
         var hipMidX_mp = (leftHip && rightHip) ? (leftHip.x + rightHip.x) / 2 : null;
+        var shoulderMidX_mp = (leftShoulder && rightShoulder) ? (leftShoulder.x + rightShoulder.x) / 2 : null;
+        var shoulderMidY_mp = (leftShoulder && rightShoulder) ? (leftShoulder.y + rightShoulder.y) / 2 : null;
 
         var fields = {
           leftAnkleY:  leftAnkle  ? leftAnkle.y  : null,
@@ -927,6 +1021,9 @@
           rightKneeX:  rightKnee  ? rightKnee.x  : null,
           rightKneeY:  rightKnee  ? rightKnee.y  : null,
           hipMidX:     hipMidX_mp,
+          shoulderMidX: shoulderMidX_mp,
+          shoulderMidY: shoulderMidY_mp,
+          shoulderVis:  Math.min(leftShoulderVis, rightShoulderVis),
           leftKneeVis: leftKneeVis_,
           rightKneeVis: rightKneeVis_,
           frameW:      videoEl.videoWidth,
@@ -960,6 +1057,9 @@
         rightKneeX:  chosen.fields.rightKneeX,
         rightKneeY:  chosen.fields.rightKneeY,
         hipMidX:     chosen.fields.hipMidX,
+        shoulderMidX: chosen.fields.shoulderMidX,
+        shoulderMidY: chosen.fields.shoulderMidY,
+        shoulderVis:  chosen.fields.shoulderVis,
         leftKneeVis: chosen.fields.leftKneeVis,
         rightKneeVis: chosen.fields.rightKneeVis,
         frameW:      chosen.fields.frameW,
@@ -978,6 +1078,7 @@
         leftKneeX: null, leftKneeY: null,
         rightKneeX: null, rightKneeY: null,
         hipMidX: null,
+        shoulderMidX: null, shoulderMidY: null, shoulderVis: null,
         leftKneeVis: null, rightKneeVis: null,
         frameW: (videoEl && videoEl.videoWidth)  || 0,
         frameH: (videoEl && videoEl.videoHeight) || 0,
@@ -1012,6 +1113,8 @@
         var rightHipKP   = findKP(keypoints, "right_hip");
         var leftKneeKP   = findKP(keypoints, "left_knee");
         var rightKneeKP  = findKP(keypoints, "right_knee");
+        var leftShoulderKP  = findKP(keypoints, "left_shoulder");
+        var rightShoulderKP = findKP(keypoints, "right_shoulder");
 
         // Bounding box area in normalized space
         var minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
@@ -1036,6 +1139,15 @@
 
         var hipMidY = (leftHipY != null && rightHipY != null) ? (leftHipY + rightHipY) / 2 : null;
         var hipMidX = (leftHipX != null && rightHipX != null) ? (leftHipX + rightHipX) / 2 : null;
+
+        var leftShoulderX  = leftShoulderKP  ? leftShoulderKP.x  / w : null;
+        var rightShoulderX = rightShoulderKP ? rightShoulderKP.x / w : null;
+        var leftShoulderY  = leftShoulderKP  ? leftShoulderKP.y  / h : null;
+        var rightShoulderY = rightShoulderKP ? rightShoulderKP.y / h : null;
+        var shoulderMidX_mn = (leftShoulderX != null && rightShoulderX != null) ? (leftShoulderX + rightShoulderX) / 2 : null;
+        var shoulderMidY_mn = (leftShoulderY != null && rightShoulderY != null) ? (leftShoulderY + rightShoulderY) / 2 : null;
+        var leftShoulderVis  = leftShoulderKP  ? (leftShoulderKP.score  || 0) : 0;
+        var rightShoulderVis = rightShoulderKP ? (rightShoulderKP.score || 0) : 0;
 
         // Use score as visibility proxy
         var leftAnkleVis = leftAnkleKP  ? (leftAnkleKP.score  || 0) : 0;
@@ -1062,6 +1174,9 @@
           rightKneeX:  rightKneeKP  ? rightKneeKP.x  / w : null,
           rightKneeY:  rightKneeKP  ? rightKneeKP.y  / h : null,
           hipMidX:     hipMidX,
+          shoulderMidX: shoulderMidX_mn,
+          shoulderMidY: shoulderMidY_mn,
+          shoulderVis:  Math.min(leftShoulderVis, rightShoulderVis),
           leftKneeVis: leftKneeVis_mn,
           rightKneeVis: rightKneeVis_mn,
           frameW:      w,
@@ -1095,6 +1210,9 @@
         rightKneeX:  chosen.fields.rightKneeX,
         rightKneeY:  chosen.fields.rightKneeY,
         hipMidX:     chosen.fields.hipMidX,
+        shoulderMidX: chosen.fields.shoulderMidX,
+        shoulderMidY: chosen.fields.shoulderMidY,
+        shoulderVis:  chosen.fields.shoulderVis,
         leftKneeVis: chosen.fields.leftKneeVis,
         rightKneeVis: chosen.fields.rightKneeVis,
         frameW:      chosen.fields.frameW,
@@ -1255,7 +1373,8 @@ async function runCapture(live, maxSec){
 
   var S={ leftAnkleY:[], rightAnkleY:[], hipMidY:[], leftVis:[], rightVis:[], tMs:[],
           leftAnkleX:[], rightAnkleX:[], leftKneeX:[], leftKneeY:[], rightKneeX:[], rightKneeY:[],
-          hipMidX:[], leftKneeVis:[], rightKneeVis:[], frameW:0, frameH:0 };
+          hipMidX:[], leftKneeVis:[], rightKneeVis:[],
+          shoulderMidX:[], shoulderMidY:[], shoulderVis:[], hipVis:[], frameW:0, frameH:0 };
   var okFrames=0;
 
   function push(s, tMs){
@@ -1274,6 +1393,10 @@ async function runCapture(live, maxSec){
     S.hipMidX.push(s.ok? s.hipMidX:NaN);
     S.leftKneeVis.push(s.ok? s.leftKneeVis:0);
     S.rightKneeVis.push(s.ok? s.rightKneeVis:0);
+    S.shoulderMidX.push(s.ok? s.shoulderMidX:NaN);
+    S.shoulderMidY.push(s.ok? s.shoulderMidY:NaN);
+    S.shoulderVis.push(s.ok? s.shoulderVis:0);
+    S.hipVis.push(s.ok? s.hipVis:0);
     if(s.frameW){ S.frameW=s.frameW; } if(s.frameH){ S.frameH=s.frameH; }
     if(s.ok) okFrames++;
   }
@@ -1357,7 +1480,8 @@ async function runCapture(live, maxSec){
   State.spm = res.spm;
   var dims = { w: S.frameW || video.videoWidth || 1, h: S.frameH || video.videoHeight || 1 };
   var over = window.CadenceCore.computeOverstride(S, res.peaks, dims);
-  showResult(res, over);
+  var trunk = window.CadenceCore.computeTrunkLean(S, dims);
+  showResult(res, over, trunk);
 }
 
 /* ---------- Result ---------- */
@@ -1381,7 +1505,27 @@ function renderOverDebug(over){
   el.textContent = lines.join('\n');
 }
 
-function showResult(res, over){
+// Trunk forward lean — reliable metric, definitive judgment allowed.
+function renderTrunk(trunk){
+  var v=$('trunkVerdict');
+  if(trunk && trunk.leanDeg != null && trunk.classification !== 'unknown'){
+    $('trunkVal').textContent = trunk.leanDeg.toFixed(1);
+    var t, cls;
+    if(trunk.classification==='good'){ t='양호 — 살짝 앞으로 기운 효율적 자세'; cls='ok'; }
+    else if(trunk.classification==='upright'){ t='너무 곧음/뒤로 젖혀짐 — 살짝 앞으로 기울이세요'; cls='low'; }
+    else { t='과도하게 앞으로 — 허리만 굽히는지 확인하세요'; cls='low'; }
+    if(trunk.confidence==='low'){ t += ' (인식 프레임 적음, 참고)'; }
+    v.textContent=t; v.className='verdict '+cls;
+    $('trunkCue').style.display='';
+  } else {
+    $('trunkVal').textContent='—';
+    v.textContent='어깨·엉덩이 인식이 부족해 전경각을 못 쟀어요 — 측면·전신·밝게 다시 촬영';
+    v.className='verdict low';
+    $('trunkCue').style.display='none';
+  }
+}
+
+function showResult(res, over, trunk){
   showScreen('result');
   $('spmVal').textContent = res.spm;
   var confMap={high:'신뢰도 높음', medium:'신뢰도 보통', low:'신뢰도 낮음 — 다시 측정 권장'};
@@ -1414,14 +1558,16 @@ function showResult(res, over){
     ? '낮은 편이니 위 범위를 목표로, 한 번에 5%씩 올려보세요.'
     : '이미 양호합니다. 더 높일 필요는 없어요 — 효율을 시험하고 싶을 때만 +5%.';
   State.targetBpm = lo;
-  // --- overstride (정강이각) ---
+  // --- trunk forward lean (reliable) ---
+  renderTrunk(trunk);
+  // --- overstride (정강이각) — experimental, reference only ---
   if(over && over.shinAngleDeg != null && over.classification !== 'unknown'){
     $('shinVal').textContent = over.shinAngleDeg.toFixed(1);
     var ovtxt, ovcls;
-    if(over.classification==='good'){ ovtxt='양호 — 발이 몸 아래로 잘 들어옴'; ovcls='ok'; }
-    else if(over.classification==='borderline'){ ovtxt='경계 — 약간 앞쪽 착지'; ovcls='low'; }
-    else { ovtxt='오버스트라이드 — 발이 몸보다 앞에서 착지'; ovcls='low'; }
-    if(over.confidence==='low'){ ovtxt += ' (무릎 인식 약함, 참고용)'; }
+    if(over.classification==='good'){ ovtxt='발이 비교적 몸 아래쪽 (참고)'; ovcls='ok'; }
+    else if(over.classification==='borderline'){ ovtxt='약간 앞쪽 착지 경향 (참고)'; ovcls='low'; }
+    else { ovtxt='앞쪽 착지 경향 — 참고용 (확정 판정 아님)'; ovcls='low'; }
+    ovtxt += ' · 실험적 지표' + (over.confidence==='low' ? ', 저신뢰' : '');
     $('overVerdict').textContent = ovtxt;
     $('overVerdict').className = 'verdict '+ovcls;
     $('overCue').style.display = '';
