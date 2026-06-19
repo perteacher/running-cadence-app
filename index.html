@@ -390,21 +390,48 @@
     }
     const spmAuto = bestLag > 0 ? (fps / bestLag) * 60 * 2 : 0;
 
-    // 8. Choose method
+    // 8. Choose method — cross-validate peak detection against autocorrelation
+    //    to catch double-counting (spurious peaks => spmPeak ~2x the true cadence).
+    const PLAUSIBLE_LO = 140, PLAUSIBLE_HI = 205;   // valid running cadence band
+    const peakInBand = spmPeak >= PLAUSIBLE_LO && spmPeak <= PLAUSIBLE_HI;
+    const autoInBand = spmAuto >= PLAUSIBLE_LO && spmAuto <= PLAUSIBLE_HI;
     const enoughPeaks = totalSteps >= 6;
     const regularSpacing = combinedCV < 0.30;
-    let method, spmRaw, confidence;
 
-    if (enoughPeaks && regularSpacing) {
+    // Autocorr locks onto the fundamental period, so it resists double-counting.
+    // If spmPeak disagrees with it by >12% (≈2x => classic double-count), distrust peaks.
+    const peakAutoDev = spmAuto > 0 ? Math.abs(spmPeak - spmAuto) / spmAuto : Infinity;
+    const agreesAuto = peakAutoDev <= 0.12;
+
+    // Heavy left/right peak-count asymmetry (>1.5x) also signals spurious peaks.
+    const lpc = leftPeaks.length, rpc = rightPeaks.length;
+    const peakRatio = (lpc > 0 && rpc > 0) ? Math.max(lpc, rpc) / Math.min(lpc, rpc) : Infinity;
+    const balanced = peakRatio <= 1.5;
+
+    let method, spmRaw, confidence, recheck = false;
+
+    // Trust peaks only when ALL hold: enough + regular + in-band + agrees-autocorr + balanced.
+    if (enoughPeaks && regularSpacing && peakInBand && agreesAuto && balanced) {
       method = 'peak';
       spmRaw = spmPeak;
-      if (combinedCV < 0.15) confidence = 'high';
-      else confidence = 'medium';
-    } else {
+      confidence = combinedCV < 0.15 ? 'high' : 'medium';
+    } else if (autoInBand) {
+      // Peaks untrustworthy but autocorr is plausible -> adopt autocorr.
       method = 'autocorr';
       spmRaw = spmAuto;
       const heavilyInterp = leftPrep.missingFrac > 0.4 && rightPrep.missingFrac > 0.4;
       confidence = heavilyInterp ? 'low' : 'medium';
+    } else if (peakInBand && enoughPeaks && regularSpacing) {
+      // Autocorr implausible (wrong harmonic) but peaks are sane -> fall back to peaks, low conf.
+      method = 'peak';
+      spmRaw = spmPeak;
+      confidence = 'low';
+    } else {
+      // Neither estimate lands in the plausible band -> flag for re-measure.
+      method = 'autocorr';
+      spmRaw = spmAuto;
+      confidence = 'low';
+      recheck = true;
     }
 
     // 9. Round
@@ -414,12 +441,14 @@
       spm,
       confidence,
       method,
+      recheck,
       stepCount: totalSteps,
       durationSec,
       fps,
       peaks: { left: leftPeaks, right: rightPeaks },
       debug: {
         fps, spmPeak, spmAuto, combinedCV, leftCV, rightCV,
+        peakAutoDev, peakRatio,
         leftPeakCount: leftPeaks.length, rightPeakCount: rightPeaks.length,
         leftMissingFrac: leftPrep.missingFrac, rightMissingFrac: rightPrep.missingFrac,
         bestLag, bestAC
@@ -440,10 +469,57 @@
       leftKneeVis, rightKneeVis
     } = samples;
 
+    // Running direction from the overall hipX trend (mean per-frame change).
+    // forward = +x for zero/rightward travel, -x for leftward. (research §1-4)
+    function meanDiff(arr) {
+      let sum = 0, cnt = 0, prev = null;
+      if (!arr) return 0;
+      for (const v of arr) {
+        if (isFinite(v)) { if (prev !== null) { sum += v - prev; cnt++; } prev = v; }
+      }
+      return cnt > 0 ? sum / cnt : 0;
+    }
+    const dir = meanDiff(hipMidX) < 0 ? -1 : 1;
+
+    // Per-side stride length (frames) -> search window for the initial-contact edge.
+    function strideWin(idxArr) {
+      if (!idxArr || idxArr.length < 2) return 10;
+      const gaps = [];
+      for (let i = 1; i < idxArr.length; i++) gaps.push(idxArr[i] - idxArr[i - 1]);
+      const g = median(gaps);
+      return Math.max(4, Math.min(20, Math.round(g * 0.6)));
+    }
+
+    // Initial-contact frame: foot is descending (y rising, image y grows down) and just
+    // reaches the contact plateau. Walk back from the y-peak to the 90%-of-rise point.
+    function initialContactIdx(yArr, p, win) {
+      const yPeak = yArr && yArr[p];
+      if (!isFinite(yPeak)) return p;
+      let vMin = yPeak, vIdx = p;
+      for (let i = p; i >= Math.max(0, p - win); i--) {
+        if (isFinite(yArr[i]) && yArr[i] < vMin) { vMin = yArr[i]; vIdx = i; }
+      }
+      const thresh = vMin + 0.90 * (yPeak - vMin);
+      for (let i = vIdx; i <= p; i++) {
+        if (isFinite(yArr[i]) && yArr[i] >= thresh) return i;
+      }
+      return p;
+    }
+
     const strikes = [];
 
     function addSide(idxArr, ankleXArr, ankleYArr, kneeXArr, kneeYArr, kneeVisArr) {
-      for (const i of idxArr) {
+      const win = strideWin(idxArr);
+      function finiteAt(k) {
+        // Number.isFinite (not global isFinite) so a missing array/coord -> false, not null->0.
+        return Number.isFinite(ankleXArr && ankleXArr[k]) && Number.isFinite(ankleYArr && ankleYArr[k]) &&
+               Number.isFinite(kneeXArr && kneeXArr[k])   && Number.isFinite(kneeYArr && kneeYArr[k]) &&
+               Number.isFinite(hipMidX && hipMidX[k]);
+      }
+      for (const p of idxArr) {
+        // Measure at initial contact, not the y-peak; fall back to the peak if IC coords missing.
+        let i = initialContactIdx(ankleYArr, p, win);
+        if (!finiteAt(i)) i = p;
         const ax = ankleXArr && ankleXArr[i];
         const ay = ankleYArr && ankleYArr[i];
         const kx = kneeXArr  && kneeXArr[i];
@@ -455,8 +531,11 @@
         const axpx = ax * w, aypx = ay * h;
         const kxpx = kx * w, kypx = ky * h;
         const hxpx = hx * w;
-        const shin   = Math.atan2(Math.abs(axpx - kxpx), Math.abs(aypx - kypx)) * 180 / Math.PI;
-        const offset = axpx - hxpx;
+        // Signed: only the forward component (foot ahead of knee in travel direction) counts.
+        // Propulsion posture (knee ahead of foot) clamps to 0 -- not overstride.
+        const fwd    = Math.max(0, dir * (axpx - kxpx));
+        const shin   = Math.atan2(fwd, Math.abs(aypx - kypx)) * 180 / Math.PI;
+        const offset = dir * (axpx - hxpx);
         strikes.push({ shin, offset, vis });
       }
     }
@@ -1150,8 +1229,7 @@ async function runCapture(live, maxSec){
   var S={ leftAnkleY:[], rightAnkleY:[], hipMidY:[], leftVis:[], rightVis:[], tMs:[],
           leftAnkleX:[], rightAnkleX:[], leftKneeX:[], leftKneeY:[], rightKneeX:[], rightKneeY:[],
           hipMidX:[], leftKneeVis:[], rightKneeVis:[], frameW:0, frameH:0 };
-  var okFrames=0, started=false, startT=0, lastTs=-1;
-  var useRVFC = ('requestVideoFrameCallback' in HTMLVideoElement.prototype);
+  var okFrames=0;
 
   function push(s, tMs){
     S.leftAnkleY.push(s.ok? s.leftAnkleY:NaN);
@@ -1173,40 +1251,74 @@ async function runCapture(live, maxSec){
     if(s.ok) okFrames++;
   }
 
-  try{ await video.play(); }catch(e){}
-
-  await new Promise(function(resolve){
-    function step(tMs){
-      if(captureAbort){ resolve(); return; }
-      if(!started){ started=true; startT=tMs; }
-      if(tMs<=lastTs){ schedule(); return; }   // skip duplicate frame (keeps MediaPipe ts strictly increasing)
-      lastTs=tMs;
-      Promise.resolve(window.PoseExtract.detect(video, tMs))
-        .catch(function(){ return {ok:false}; })
-        .then(function(s){
-          push(s, tMs);
-          setStatus('분석 중…  인식 '+okFrames+' 프레임');
-          var elapsed=(tMs-startT)/1000;
-          var done = live ? (elapsed>=maxSec) : (video.ended || elapsed>=maxSec);
-          if(done){ resolve(); } else { schedule(); }
-        });
-    }
-    function schedule(){
-      if(captureAbort){ resolve(); return; }
-      if(useRVFC){
-        video.requestVideoFrameCallback(function(now, meta){
-          var tMs = live ? performance.now() : (meta.mediaTime*1000);
-          step(tMs);
-        });
-      } else {
-        requestAnimationFrame(function(){
-          var tMs = live ? performance.now() : (video.currentTime*1000);
-          step(tMs);
-        });
+  if(live){
+    // ---- LIVE camera: real-time sampling. Cannot frame-step a live stream,
+    //      so keep playing + rVFC/rAF (unchanged behaviour). ----
+    var started=false, startT=0, lastTs=-1;
+    var useRVFC = ('requestVideoFrameCallback' in HTMLVideoElement.prototype);
+    try{ await video.play(); }catch(e){}
+    await new Promise(function(resolve){
+      function step(tMs){
+        if(captureAbort){ resolve(); return; }
+        if(!started){ started=true; startT=tMs; }
+        if(tMs<=lastTs){ schedule(); return; }   // keep MediaPipe ts strictly increasing
+        lastTs=tMs;
+        Promise.resolve(window.PoseExtract.detect(video, tMs))
+          .catch(function(){ return {ok:false}; })
+          .then(function(s){
+            push(s, tMs);
+            setStatus('분석 중…  인식 '+okFrames+' 프레임');
+            if((tMs-startT)/1000 >= maxSec){ resolve(); } else { schedule(); }
+          });
       }
+      function schedule(){
+        if(captureAbort){ resolve(); return; }
+        if(useRVFC){
+          video.requestVideoFrameCallback(function(){ step(performance.now()); });
+        } else {
+          requestAnimationFrame(function(){ step(performance.now()); });
+        }
+      }
+      schedule();
+    });
+  } else {
+    // ---- UPLOADED FILE: deterministic frame-by-frame seek walk. ----
+    // Playing-while-analyzing drops frames nondeterministically (pose-inference lag),
+    // so the same clip produced a different signal every run (cadence 171–225,
+    // overstride 15–34°). Instead we step currentTime on a fixed 30fps grid and await
+    // each decoded frame, so every frame is processed exactly once, in order —
+    // identical result on every run of the same file.
+    try{ video.pause(); }catch(e){}
+    var DT = 1/30;
+    var dur = (isFinite(video.duration) && video.duration>0)
+              ? Math.min(video.duration, maxSec) : maxSec;
+    var totalFrames = Math.max(1, Math.floor(dur/DT));
+    var lastTsMs = -1;
+    function seekTo(t){
+      return new Promise(function(resolve){
+        if(Math.abs(video.currentTime - t) < 1e-3){ requestAnimationFrame(function(){ resolve(); }); return; }
+        var done=false;
+        function finish(){ if(done) return; done=true; video.removeEventListener('seeked', onSeeked); resolve(); }
+        function onSeeked(){ finish(); }
+        video.addEventListener('seeked', onSeeked);
+        try{ video.currentTime = t; }catch(e){ finish(); return; }
+        setTimeout(finish, 400);   // safety net if 'seeked' never fires (no-op seek)
+      });
     }
-    schedule();
-  });
+    for(var f=0; f<=totalFrames; f++){
+      if(captureAbort){ break; }
+      var ct = Math.min(f*DT, Math.max(0, dur-1e-3));
+      await seekTo(ct);                                 // await decoded frame
+      var tsMs = ct*1000;
+      if(tsMs <= lastTsMs){ tsMs = lastTsMs + 1; }       // strictly increasing for MediaPipe
+      lastTsMs = tsMs;
+      var s;
+      try{ s = await Promise.resolve(window.PoseExtract.detect(video, tsMs)); }
+      catch(e){ s = {ok:false}; }
+      push(s, tsMs);
+      setStatus('분석 중…  '+(f+1)+'/'+(totalFrames+1)+' 프레임 (인식 '+okFrames+')');
+    }
+  }
 
   stopStream();
   if(captureAbort){ return; }
@@ -1227,6 +1339,7 @@ function showResult(res, over){
   $('spmVal').textContent = res.spm;
   var confMap={high:'신뢰도 높음', medium:'신뢰도 보통', low:'신뢰도 낮음 — 다시 측정 권장'};
   $('confChip').textContent = (confMap[res.confidence]||'') + ' · ' + (res.stepCount) + '걸음 / ' + res.durationSec.toFixed(1) + '초 · ' + (res.method==='peak'?'피크검출':'주파수분석');
+  if(res.recheck){ $('confChip').textContent += ' · ⚠ 측정 불안정 — 다시 측정 권장'; }
 
   // verdict
   var v=$('verdict'), txt='', cls='ok';

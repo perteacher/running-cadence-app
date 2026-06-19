@@ -215,21 +215,48 @@
     }
     const spmAuto = bestLag > 0 ? (fps / bestLag) * 60 * 2 : 0;
 
-    // 8. Choose method
+    // 8. Choose method — cross-validate peak detection against autocorrelation
+    //    to catch double-counting (spurious peaks => spmPeak ~2x the true cadence).
+    const PLAUSIBLE_LO = 140, PLAUSIBLE_HI = 205;   // valid running cadence band
+    const peakInBand = spmPeak >= PLAUSIBLE_LO && spmPeak <= PLAUSIBLE_HI;
+    const autoInBand = spmAuto >= PLAUSIBLE_LO && spmAuto <= PLAUSIBLE_HI;
     const enoughPeaks = totalSteps >= 6;
     const regularSpacing = combinedCV < 0.30;
-    let method, spmRaw, confidence;
 
-    if (enoughPeaks && regularSpacing) {
+    // Autocorr locks onto the fundamental period, so it resists double-counting.
+    // If spmPeak disagrees with it by >12% (≈2x => classic double-count), distrust peaks.
+    const peakAutoDev = spmAuto > 0 ? Math.abs(spmPeak - spmAuto) / spmAuto : Infinity;
+    const agreesAuto = peakAutoDev <= 0.12;
+
+    // Heavy left/right peak-count asymmetry (>1.5x) also signals spurious peaks.
+    const lpc = leftPeaks.length, rpc = rightPeaks.length;
+    const peakRatio = (lpc > 0 && rpc > 0) ? Math.max(lpc, rpc) / Math.min(lpc, rpc) : Infinity;
+    const balanced = peakRatio <= 1.5;
+
+    let method, spmRaw, confidence, recheck = false;
+
+    // Trust peaks only when ALL hold: enough + regular + in-band + agrees-autocorr + balanced.
+    if (enoughPeaks && regularSpacing && peakInBand && agreesAuto && balanced) {
       method = 'peak';
       spmRaw = spmPeak;
-      if (combinedCV < 0.15) confidence = 'high';
-      else confidence = 'medium';
-    } else {
+      confidence = combinedCV < 0.15 ? 'high' : 'medium';
+    } else if (autoInBand) {
+      // Peaks untrustworthy but autocorr is plausible -> adopt autocorr.
       method = 'autocorr';
       spmRaw = spmAuto;
       const heavilyInterp = leftPrep.missingFrac > 0.4 && rightPrep.missingFrac > 0.4;
       confidence = heavilyInterp ? 'low' : 'medium';
+    } else if (peakInBand && enoughPeaks && regularSpacing) {
+      // Autocorr implausible (wrong harmonic) but peaks are sane -> fall back to peaks, low conf.
+      method = 'peak';
+      spmRaw = spmPeak;
+      confidence = 'low';
+    } else {
+      // Neither estimate lands in the plausible band -> flag for re-measure.
+      method = 'autocorr';
+      spmRaw = spmAuto;
+      confidence = 'low';
+      recheck = true;
     }
 
     // 9. Round
@@ -239,12 +266,14 @@
       spm,
       confidence,
       method,
+      recheck,
       stepCount: totalSteps,
       durationSec,
       fps,
       peaks: { left: leftPeaks, right: rightPeaks },
       debug: {
         fps, spmPeak, spmAuto, combinedCV, leftCV, rightCV,
+        peakAutoDev, peakRatio,
         leftPeakCount: leftPeaks.length, rightPeakCount: rightPeaks.length,
         leftMissingFrac: leftPrep.missingFrac, rightMissingFrac: rightPrep.missingFrac,
         bestLag, bestAC
@@ -265,10 +294,57 @@
       leftKneeVis, rightKneeVis
     } = samples;
 
+    // Running direction from the overall hipX trend (mean per-frame change).
+    // forward = +x for zero/rightward travel, -x for leftward. (research §1-4)
+    function meanDiff(arr) {
+      let sum = 0, cnt = 0, prev = null;
+      if (!arr) return 0;
+      for (const v of arr) {
+        if (isFinite(v)) { if (prev !== null) { sum += v - prev; cnt++; } prev = v; }
+      }
+      return cnt > 0 ? sum / cnt : 0;
+    }
+    const dir = meanDiff(hipMidX) < 0 ? -1 : 1;
+
+    // Per-side stride length (frames) -> search window for the initial-contact edge.
+    function strideWin(idxArr) {
+      if (!idxArr || idxArr.length < 2) return 10;
+      const gaps = [];
+      for (let i = 1; i < idxArr.length; i++) gaps.push(idxArr[i] - idxArr[i - 1]);
+      const g = median(gaps);
+      return Math.max(4, Math.min(20, Math.round(g * 0.6)));
+    }
+
+    // Initial-contact frame: foot is descending (y rising, image y grows down) and just
+    // reaches the contact plateau. Walk back from the y-peak to the 90%-of-rise point.
+    function initialContactIdx(yArr, p, win) {
+      const yPeak = yArr && yArr[p];
+      if (!isFinite(yPeak)) return p;
+      let vMin = yPeak, vIdx = p;
+      for (let i = p; i >= Math.max(0, p - win); i--) {
+        if (isFinite(yArr[i]) && yArr[i] < vMin) { vMin = yArr[i]; vIdx = i; }
+      }
+      const thresh = vMin + 0.90 * (yPeak - vMin);
+      for (let i = vIdx; i <= p; i++) {
+        if (isFinite(yArr[i]) && yArr[i] >= thresh) return i;
+      }
+      return p;
+    }
+
     const strikes = [];
 
     function addSide(idxArr, ankleXArr, ankleYArr, kneeXArr, kneeYArr, kneeVisArr) {
-      for (const i of idxArr) {
+      const win = strideWin(idxArr);
+      function finiteAt(k) {
+        // Number.isFinite (not global isFinite) so a missing array/coord -> false, not null->0.
+        return Number.isFinite(ankleXArr && ankleXArr[k]) && Number.isFinite(ankleYArr && ankleYArr[k]) &&
+               Number.isFinite(kneeXArr && kneeXArr[k])   && Number.isFinite(kneeYArr && kneeYArr[k]) &&
+               Number.isFinite(hipMidX && hipMidX[k]);
+      }
+      for (const p of idxArr) {
+        // Measure at initial contact, not the y-peak; fall back to the peak if IC coords missing.
+        let i = initialContactIdx(ankleYArr, p, win);
+        if (!finiteAt(i)) i = p;
         const ax = ankleXArr && ankleXArr[i];
         const ay = ankleYArr && ankleYArr[i];
         const kx = kneeXArr  && kneeXArr[i];
@@ -280,8 +356,11 @@
         const axpx = ax * w, aypx = ay * h;
         const kxpx = kx * w, kypx = ky * h;
         const hxpx = hx * w;
-        const shin   = Math.atan2(Math.abs(axpx - kxpx), Math.abs(aypx - kypx)) * 180 / Math.PI;
-        const offset = axpx - hxpx;
+        // Signed: only the forward component (foot ahead of knee in travel direction) counts.
+        // Propulsion posture (knee ahead of foot) clamps to 0 -- not overstride.
+        const fwd    = Math.max(0, dir * (axpx - kxpx));
+        const shin   = Math.atan2(fwd, Math.abs(aypx - kypx)) * 180 / Math.PI;
+        const offset = dir * (axpx - hxpx);
         strikes.push({ shin, offset, vis });
       }
     }
@@ -456,6 +535,82 @@
       const ok20 = r20.classification === 'overstride';
       const ok = ok12 && ok20;
       console.log(`${ok ? 'PASS' : 'FAIL'} OSTest-d: shin12=${r12.shinAngleDeg}=>${r12.classification} shin20=${r20.shinAngleDeg}=>${r20.classification}`);
+    }
+
+    // --- Double-count guard: spurious peaks at 2x must NOT inflate cadence ---
+    {
+      // True stride 1.5 Hz (=>180 SPM) plus a strong 2nd harmonic, so the peak detector
+      // finds ~2 peaks per stride. The guard should distrust peaks and adopt autocorr.
+      const PI2 = 2 * Math.PI, fps = 30, nn = 300, f = 1.5;
+      const lA = [], rA = [], lV = [], rV = [], ts = [];
+      for (let i = 0; i < nn; i++) {
+        const t = i / fps;
+        ts.push(t * 1000);
+        lA.push(0.8 + 0.05 * Math.cos(PI2 * f * t)            + 0.045 * Math.cos(PI2 * 2 * f * t));
+        rA.push(0.8 + 0.05 * Math.cos(PI2 * f * t + Math.PI)  + 0.045 * Math.cos(PI2 * 2 * f * t + Math.PI));
+        lV.push(1); rV.push(1);
+      }
+      const s = { leftAnkleY: lA, rightAnkleY: rA, hipMidY: new Array(nn).fill(0.5), leftVis: lV, rightVis: rV, tMs: ts };
+      const r = CadenceCore.computeSPM(s);
+      const guarded = r.spm >= 165 && r.spm <= 195 && r.method === 'autocorr';
+      console.log(`${guarded ? 'PASS' : 'FAIL'} DoubleCountGuard: spm=${r.spm} method=${r.method} spmPeak≈${Math.round(r.debug.spmPeak)} spmAuto≈${Math.round(r.debug.spmAuto)} conf=${r.confidence}`);
+    }
+
+    // --- Overstride: initial-contact + signed shin angle ---
+    function osArrays(n, obj) {
+      const o = {};
+      for (const k in obj) o[k] = new Array(n).fill(obj[k]);
+      return o;
+    }
+
+    // (e) Initial contact, foot AHEAD of knee in travel direction -> positive angle.
+    {
+      const n = 30, idxs = [5, 12, 19, 26];
+      const s = osArrays(n, {
+        leftAnkleX: 0.62, rightAnkleX: 0.62, leftAnkleY: 0.62, rightAnkleY: 0.62,
+        leftKneeX: 0.50, leftKneeY: 0.42, rightKneeX: 0.50, rightKneeY: 0.42,
+        leftKneeVis: 0.9, rightKneeVis: 0.9
+      });
+      s.hipMidX = []; for (let i = 0; i < n; i++) s.hipMidX.push(0.30 + 0.01 * i); // rightward trend -> dir=+1
+      const r = CadenceCore.computeOverstride(s, { left: idxs, right: [] }, { w: 1000, h: 1000 });
+      const ok = r.shinAngleDeg > 5 && r.classification !== 'unknown';
+      console.log(`${ok ? 'PASS' : 'FAIL'} OSTest-e: IC foot-ahead shin=${r.shinAngleDeg} class=${r.classification}`);
+    }
+
+    // (f) Propulsion posture: knee AHEAD of foot -> clamps to 0 (not overstride).
+    {
+      const n = 30, idxs = [5, 12, 19, 26];
+      const s = osArrays(n, {
+        leftAnkleX: 0.40, rightAnkleX: 0.40, leftAnkleY: 0.62, rightAnkleY: 0.62,  // ankle BEHIND knee
+        leftKneeX: 0.55, leftKneeY: 0.42, rightKneeX: 0.55, rightKneeY: 0.42,
+        leftKneeVis: 0.9, rightKneeVis: 0.9
+      });
+      s.hipMidX = []; for (let i = 0; i < n; i++) s.hipMidX.push(0.30 + 0.01 * i); // rightward -> dir=+1
+      const r = CadenceCore.computeOverstride(s, { left: idxs, right: [] }, { w: 1000, h: 1000 });
+      const ok = r.shinAngleDeg === 0 && r.classification === 'good';
+      console.log(`${ok ? 'PASS' : 'FAIL'} OSTest-f: propulsion shin=${r.shinAngleDeg} class=${r.classification}`);
+    }
+
+    // (g) Direction-agnostic: foot-ahead overstride detected for BOTH L->R and R->L travel.
+    {
+      const n = 30, idxs = [5, 12, 19, 26];
+      const sR = osArrays(n, {              // rightward: dir=+1, foot ahead => ankleX > kneeX
+        leftAnkleX: 0.70, rightAnkleX: 0.70, leftAnkleY: 0.62, rightAnkleY: 0.62,
+        leftKneeX: 0.50, leftKneeY: 0.42, rightKneeX: 0.50, rightKneeY: 0.42,
+        leftKneeVis: 0.9, rightKneeVis: 0.9
+      });
+      sR.hipMidX = []; for (let i = 0; i < n; i++) sR.hipMidX.push(0.20 + 0.01 * i);
+      const sL = osArrays(n, {              // leftward: dir=-1, foot ahead => ankleX < kneeX (mirror)
+        leftAnkleX: 0.30, rightAnkleX: 0.30, leftAnkleY: 0.62, rightAnkleY: 0.62,
+        leftKneeX: 0.50, leftKneeY: 0.42, rightKneeX: 0.50, rightKneeY: 0.42,
+        leftKneeVis: 0.9, rightKneeVis: 0.9
+      });
+      sL.hipMidX = []; for (let i = 0; i < n; i++) sL.hipMidX.push(0.80 - 0.01 * i);
+      const rR = CadenceCore.computeOverstride(sR, { left: idxs, right: [] }, { w: 1000, h: 1000 });
+      const rL = CadenceCore.computeOverstride(sL, { left: idxs, right: [] }, { w: 1000, h: 1000 });
+      const ok = Math.abs(rR.shinAngleDeg - rL.shinAngleDeg) <= 0.2 &&
+                 rR.classification === 'overstride' && rL.classification === 'overstride';
+      console.log(`${ok ? 'PASS' : 'FAIL'} OSTest-g: R-travel=${rR.shinAngleDeg}(${rR.classification}) L-travel=${rL.shinAngleDeg}(${rL.classification})`);
     }
   }
 
