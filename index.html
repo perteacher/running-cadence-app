@@ -180,6 +180,24 @@
         <pre id="overDebugBody" style="font-size:11px; color:var(--muted); white-space:pre-wrap; word-break:break-word; margin:10px 0 0; line-height:1.55; font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;"></pre>
       </details>
     </div>
+    <details class="card" id="poseCard">
+      <summary class="label" style="cursor:pointer; text-align:center; margin:0;">🦴 자세 보기 — 측정 점·선·각도</summary>
+      <div id="poseBody" style="margin-top:14px;">
+        <canvas id="poseCanvas" style="width:100%; height:auto; border-radius:12px; background:#000; display:block;"></canvas>
+        <p class="hint" id="poseAngleLabel" style="text-align:center; margin:10px 0 0; color:var(--txt); font-size:14px;"></p>
+        <p class="hint" id="poseCardRef" style="text-align:center; font-size:11px; color:#6b7785; margin:4px 0 0;"></p>
+        <div class="row" style="display:flex; align-items:center; gap:10px; margin-top:12px;">
+          <span class="unit" id="poseFrameNum" style="min-width:48px; text-align:center;">—</span>
+          <input type="range" id="poseSlider" min="0" max="0" value="0" step="1" style="flex:1; accent-color:var(--accent);">
+        </div>
+        <div style="display:flex; gap:8px; margin-top:12px;">
+          <button class="btn secondary" id="btnJumpTouchdown" style="padding:11px; font-size:14px;">🦶 착지 프레임</button>
+          <button class="btn secondary" id="btnJumpTrunk" style="padding:11px; font-size:14px;">🧍 몸통 측정 프레임</button>
+        </div>
+        <p class="hint" id="poseLegend" style="text-align:center; font-size:11px; color:#6b7785; margin-top:10px;"></p>
+      </div>
+      <p class="hint" id="poseEmpty" style="text-align:center; display:none;">표시할 데이터 없음 — keypoint/프레임이 없어요.</p>
+    </details>
     <div class="warn">⚠️ 케이던스를 올리면 부하가 <b>사라지는 게 아니라</b> 종아리·아킬레스로 <b>옮겨갑니다</b>. 한 번에 5%씩, 몇 주에 걸쳐 천천히 올리세요.</div>
     <div class="stack">
       <button class="btn primary" id="btnPractice">🎵 연습 모드 (메트로놈)</button>
@@ -1371,6 +1389,10 @@ function createMetronome(){
 /* ---------- App state + helpers ---------- */
 var State = { mode:'treadmill', paceSpeed:null, paceUnit:'kmh', paceRaw:null, spm:null, targetBpm:null, userTarget:null, cadenceOk:false };
 var metro = createMetronome();
+// Pose-preview overlay state (visualization only; mirrors the SAME per-frame math the
+// metrics use, so the on-canvas angle equals the result-card value at the measure frame).
+var Viz = { S:null, dims:null, over:null, trunk:null, fps:30, dir:1, nFrames:0,
+            tdFrames:[], tdMedians:[], tdIdx:0, trunkFrame:0, canSeek:false, seeking:false, pending:null, cur:0 };
 
 function $(id){ return document.getElementById(id); }
 function showScreen(name){
@@ -1587,6 +1609,7 @@ async function runCapture(live, maxSec){
   var over = window.CadenceCore.computeOverstride(S, res.peaks, dims);
   var trunk = window.CadenceCore.computeTrunkLean(S, dims);
   var vo = window.CadenceCore.computeVerticalOscillation(S, dims);
+  Viz.S=S; Viz.dims=dims; Viz.over=over; Viz.trunk=trunk; Viz.fps=res.fps;
   showResult(res, over, trunk, vo);
 }
 
@@ -1810,6 +1833,8 @@ function showResult(res, over, trunk, vo){
   // cross-metric consistency (display only) + root-cause synthesis
   applyCrossCheck(res, over, trunk, vo);
   $('summaryText').textContent = buildSummary(res, over, trunk, vo, cls==='low');
+  // keypoint visualization overlay (presentation only)
+  setupPosePreview();
 }
 
 $('btnAgain').addEventListener('click', function(){ showScreen('setup'); });
@@ -1838,6 +1863,219 @@ $('btnMetro').addEventListener('click', function(){
   else { metro.start(State.targetBpm); btn.textContent='⏸ 정지'; btn.className='btn secondary'; }
 });
 $('btnBack').addEventListener('click', function(){ metro.stop(); $('btnMetro').textContent='▶︎ 메트로놈 시작'; $('btnMetro').className='btn primary'; showScreen('result'); });
+
+/* ---------- Pose-preview overlay (keypoint dots / lines / angle arcs) ---------- */
+// Direction sign from the hipX trend — IDENTICAL rule to the core metrics, so the
+// per-frame angles drawn here equal the result-card numbers at the measurement frame.
+function vizMeanDir(xs){
+  var sum=0, cnt=0, prev=null;
+  if(!xs) return 1;
+  for(var i=0;i<xs.length;i++){ var v=xs[i]; if(isFinite(v)){ if(prev!==null){ sum+=v-prev; cnt++; } prev=v; } }
+  return (cnt>0 && sum<0) ? -1 : 1;
+}
+function vizFin(){ for(var i=0;i<arguments.length;i++){ if(!isFinite(arguments[i])) return false; } return true; }
+// Trunk lean at one frame (mirrors computeTrunkLean per-frame: atan2(dir*(sx-hx)*w, |(sy-hy)*h|)).
+function vizFrameTorsoAngle(f){
+  var S=Viz.S, w=Viz.dims.w, h=Viz.dims.h;
+  var sx=S.shoulderMidX[f], sy=S.shoulderMidY[f], hx=S.hipMidX[f], hy=S.hipMidY[f];
+  if(!vizFin(sx,sy,hx,hy)) return null;
+  var vert=Math.abs((sy-hy)*h); if(vert<1) return null;
+  return Math.atan2(Viz.dir*(sx-hx)*w, vert)*180/Math.PI;
+}
+// Shin (knee->ankle) forward angle at one frame (mirrors shinAt: forward component clamped >=0).
+function vizFrameShinAngle(f, foot){
+  var S=Viz.S, w=Viz.dims.w, h=Viz.dims.h;
+  var ax=foot==='L'?S.leftAnkleX[f]:S.rightAnkleX[f];
+  var ay=foot==='L'?S.leftAnkleY[f]:S.rightAnkleY[f];
+  var kx=foot==='L'?S.leftKneeX[f]:S.rightKneeX[f];
+  var ky=foot==='L'?S.leftKneeY[f]:S.rightKneeY[f];
+  if(!vizFin(ax,ay,kx,ky)) return null;
+  return Math.atan2(Math.max(0, Viz.dir*(ax-kx)*w), Math.abs((ay-ky)*h))*180/Math.PI;
+}
+
+function setupPosePreview(){
+  var S=Viz.S;
+  var ok = !!(S && Viz.dims && Viz.dims.w>1 && Viz.dims.h>1 && S.tMs && S.tMs.length>0 &&
+              S.hipMidX && S.hipMidX.some(isFinite));
+  if(!ok){
+    $('poseBody').style.display='none';
+    $('poseEmpty').style.display='';
+    $('poseCard').open=false;
+    return;
+  }
+  $('poseBody').style.display='';
+  $('poseEmpty').style.display='none';
+  Viz.nFrames = S.tMs.length;
+  Viz.dir = vizMeanDir(S.hipMidX);
+  var nearFoot = (Viz.over && Viz.over.nearFoot) ? Viz.over.nearFoot : 'L';
+
+  // touchdown frames (the near leg's contact frames overstride used) + each stride's
+  // WINDOW median (the value that actually feeds the card; a single frame at contact is
+  // the instantaneous peak and reads higher, so we surface both).
+  Viz.tdFrames=[]; Viz.tdMedians=[];
+  if(Viz.over && Viz.over.debug && Viz.over.debug.strides){
+    Viz.over.debug.strides.forEach(function(s){
+      if(s.touchdownFrame>=0 && s.touchdownFrame<Viz.nFrames){
+        Viz.tdFrames.push(s.touchdownFrame);
+        Viz.tdMedians.push(s.strideMedian);
+      }
+    });
+  }
+  // default touchdown = the stride whose window median best matches the card -> its
+  // "착지측정" label reads the card value.
+  Viz.tdIdx=0;
+  if(Viz.tdMedians.length && Viz.over && Viz.over.shinAngleDeg!=null){
+    var bestS=Infinity;
+    for(var i=0;i<Viz.tdMedians.length;i++){
+      if(Viz.tdMedians[i]==null) continue;
+      var d=Math.abs(Viz.tdMedians[i]-Viz.over.shinAngleDeg);
+      if(d<bestS){ bestS=d; Viz.tdIdx=i; }
+    }
+  }
+  // trunk representative frame = frame whose torso angle best matches the card lean
+  Viz.trunkFrame=0;
+  if(Viz.trunk && Viz.trunk.leanDeg!=null){
+    var bestT=Infinity;
+    for(var g=0; g<Viz.nFrames; g++){
+      var ta=vizFrameTorsoAngle(g);
+      if(ta==null) continue;
+      var dt=Math.abs(ta-Viz.trunk.leanDeg);
+      if(dt<bestT){ bestT=dt; Viz.trunkFrame=g; }
+    }
+  }
+
+  var sl=$('poseSlider'); sl.min=0; sl.max=Viz.nFrames-1; sl.step=1;
+  var cv=$('poseCanvas'); cv.width=Viz.dims.w; cv.height=Viz.dims.h;
+  Viz.canSeek = isFinite(video.duration) && video.duration>0;
+
+  var tv = (Viz.trunk && Viz.trunk.leanDeg!=null) ? Viz.trunk.leanDeg.toFixed(1)+'°' : '–';
+  var sv = (Viz.over && Viz.over.shinAngleDeg!=null) ? Viz.over.shinAngleDeg.toFixed(1)+'°('+(nearFoot==='L'?'좌':'우')+')' : '–';
+  $('poseCardRef').textContent = '측정 카드값 — 몸통 '+tv+' · 정강이 '+sv+'  (측정 프레임에서 라벨이 이 값과 일치)';
+  $('poseLegend').textContent = (Viz.canSeek?'':'녹화 모드: 프레임 이미지 없이 점·선만 표시 · ')
+    + '● 어깨(청록)·엉덩이(주황)·무릎·발목 / 몸통선·다리선 / 진행방향 '+(Viz.dir>0?'→':'←');
+
+  var startF = Viz.tdFrames.length ? Viz.tdFrames[Viz.tdIdx] : Math.floor(Viz.nFrames/2);
+  gotoFrame(startF);
+}
+
+function gotoFrame(f){
+  if(!Viz.nFrames) return;
+  f=Math.max(0, Math.min(Viz.nFrames-1, Math.round(f)));
+  Viz.cur=f;
+  $('poseSlider').value=f;
+  $('poseFrameNum').textContent='#'+f;
+  if(Viz.canSeek && Viz.S.tMs[f]!=null){
+    seekVideo(Viz.S.tMs[f]/1000, function(){ drawPose(f); });
+  } else {
+    drawPose(f);
+  }
+}
+
+// Collapse rapid slider moves into the latest seek; draw on each settled 'seeked'.
+function seekVideo(t, cb){
+  Viz.pending={ t:t, cb:cb };
+  if(Viz.seeking) return;
+  Viz.seeking=true;
+  (function run(){
+    var job=Viz.pending; Viz.pending=null;
+    if(!job){ Viz.seeking=false; return; }
+    if(Math.abs(video.currentTime - job.t) < 1e-3){
+      job.cb();
+      if(Viz.pending) run(); else Viz.seeking=false;
+      return;
+    }
+    function onSeeked(){
+      video.removeEventListener('seeked', onSeeked);
+      job.cb();
+      if(Viz.pending) run(); else Viz.seeking=false;
+    }
+    video.addEventListener('seeked', onSeeked);
+    try{ video.currentTime=job.t; }
+    catch(e){ video.removeEventListener('seeked', onSeeked); job.cb(); if(Viz.pending) run(); else Viz.seeking=false; }
+  })();
+}
+
+function drawPose(f){
+  var cv=$('poseCanvas'); if(!cv) return;
+  var ctx=cv.getContext('2d'); var w=cv.width, h=cv.height, S=Viz.S;
+  ctx.clearRect(0,0,w,h);
+  if(Viz.canSeek){ try{ ctx.drawImage(video, 0,0, w, h); }catch(e){ ctx.fillStyle='#0e1116'; ctx.fillRect(0,0,w,h); } }
+  else { ctx.fillStyle='#0e1116'; ctx.fillRect(0,0,w,h); }
+
+  function pt(p){ return p && isFinite(p[0]) && isFinite(p[1]); }
+  function px(p){ return [p[0]*w, p[1]*h]; }
+  var sh=[S.shoulderMidX[f],S.shoulderMidY[f]], hp=[S.hipMidX[f],S.hipMidY[f]];
+  var lk=[S.leftKneeX[f],S.leftKneeY[f]], la=[S.leftAnkleX[f],S.leftAnkleY[f]];
+  var rk=[S.rightKneeX[f],S.rightKneeY[f]], ra=[S.rightAnkleX[f],S.rightAnkleY[f]];
+
+  ctx.lineCap='round'; ctx.lineWidth=Math.max(2, w*0.006);
+  function line(a,b,color){ if(pt(a)&&pt(b)){ var A=px(a),B=px(b); ctx.strokeStyle=color; ctx.beginPath(); ctx.moveTo(A[0],A[1]); ctx.lineTo(B[0],B[1]); ctx.stroke(); } }
+  line(hp,lk,'#60a5fa'); line(lk,la,'#60a5fa');   // left leg
+  line(hp,rk,'#a78bfa'); line(rk,ra,'#a78bfa');   // right leg
+  line(sh,hp,'#2dd4bf');                          // torso
+
+  var R=Math.max(4, w*0.012);
+  function dot(p,color){ if(pt(p)){ var A=px(p); ctx.beginPath(); ctx.arc(A[0],A[1],R,0,2*Math.PI); ctx.fillStyle=color; ctx.fill(); ctx.lineWidth=Math.max(1.5,w*0.003); ctx.strokeStyle='#0e1116'; ctx.stroke(); } }
+  dot(sh,'#2dd4bf'); dot(hp,'#f59e0b');
+  dot(lk,'#60a5fa'); dot(la,'#60a5fa');
+  dot(rk,'#a78bfa'); dot(ra,'#a78bfa');
+
+  var nearFoot=(Viz.over && Viz.over.nearFoot)?Viz.over.nearFoot:'L';
+  var torso=vizFrameTorsoAngle(f);
+  if(torso!=null && pt(hp)) drawAngleArc(ctx, px(hp), torso, '#2dd4bf', w, true);
+  var shin=vizFrameShinAngle(f, nearFoot);
+  var nk=nearFoot==='L'?lk:rk;
+  if(shin!=null && pt(nk)) drawAngleArc(ctx, px(nk), shin, '#fbbf24', w, false);
+
+  updatePoseLabels(f, torso, shin, nearFoot);
+}
+
+// Dashed vertical reference + arc swept by `angleDeg` toward travel direction + degree text.
+function drawAngleArc(ctx, joint, angleDeg, color, w, dirUp){
+  var L=Math.max(28, w*0.12), ux=joint[0], uy=joint[1];
+  var refDy=dirUp?-1:1, rad=angleDeg*Math.PI/180;
+  var rx=ux, ry=uy+refDy*L;                              // vertical reference end
+  var lx=ux+Viz.dir*Math.sin(rad)*L, ly=uy+refDy*Math.cos(rad)*L; // measured-angle ray
+  ctx.save();
+  ctx.setLineDash([5,4]); ctx.lineWidth=Math.max(1.5,w*0.003); ctx.strokeStyle='rgba(255,255,255,.55)';
+  ctx.beginPath(); ctx.moveTo(ux,uy); ctx.lineTo(rx,ry); ctx.stroke();
+  ctx.setLineDash([]);
+  var a0=Math.atan2(ry-uy,rx-ux), a1=Math.atan2(ly-uy,lx-ux);
+  ctx.lineWidth=Math.max(2.5,w*0.005); ctx.strokeStyle=color;
+  ctx.beginPath(); ctx.arc(ux,uy, L*0.55, Math.min(a0,a1), Math.max(a0,a1)); ctx.stroke();
+  ctx.fillStyle=color; ctx.font='bold '+Math.max(13,Math.round(w*0.03))+'px sans-serif';
+  ctx.textBaseline='middle';
+  ctx.fillText(angleDeg.toFixed(0)+'°', ux+Viz.dir*L*0.62, uy+refDy*L*0.35);
+  ctx.restore();
+}
+
+function updatePoseLabels(f, torso, shin, nearFoot){
+  var parts=[];
+  if(torso!=null){
+    var tm = (f===Viz.trunkFrame && Viz.trunk && Viz.trunk.leanDeg!=null) ? ' = 카드값' : '';
+    parts.push('몸통 '+torso.toFixed(1)+'°'+tm);
+  }
+  if(shin!=null){
+    var idx=Viz.tdFrames.indexOf(f), sm='';
+    if(idx>=0){
+      var med=Viz.tdMedians[idx];
+      sm=' · 착지측정 '+(med!=null?med.toFixed(1):'–')+'°';
+      if(med!=null && Viz.over && Viz.over.shinAngleDeg!=null && Math.abs(med-Viz.over.shinAngleDeg)<0.06){ sm+=' =카드값'; }
+    }
+    parts.push('정강이('+(nearFoot==='L'?'좌':'우')+') '+shin.toFixed(1)+'°'+sm);
+  }
+  $('poseAngleLabel').textContent = parts.length ? parts.join('　·　') : '이 프레임은 keypoint 인식이 부족해요';
+}
+
+$('poseSlider').addEventListener('input', function(){ gotoFrame(parseInt(this.value,10)); });
+$('btnJumpTouchdown').addEventListener('click', function(){
+  if(!Viz.tdFrames.length){ return; }
+  Viz.tdIdx=(Viz.tdIdx+1)%Viz.tdFrames.length;
+  gotoFrame(Viz.tdFrames[Viz.tdIdx]);
+});
+$('btnJumpTrunk').addEventListener('click', function(){ gotoFrame(Viz.trunkFrame); });
+// redraw when the user expands the panel (canvas may have been laid out while hidden)
+$('poseCard').addEventListener('toggle', function(){ if(this.open && Viz.nFrames) gotoFrame(Viz.cur); });
 
 /* init */
 applyMode('treadmill');
