@@ -99,6 +99,14 @@
         </div>
         <p class="hint">콘솔 표시 단위로 입력하세요. 그 속도의 정상 케이던스 대역과 비교해 판정합니다. 비워도 됩니다.</p>
       </div>
+      <div style="border-top:1px solid var(--line); margin-top:16px; padding-top:16px;">
+        <p class="label" style="margin:0 0 9px;">🎯 목표 케이던스 (선택 — 분석 후 비교용)</p>
+        <div class="row" style="display:flex; gap:10px; align-items:center;">
+          <input type="number" id="userTargetInput" inputmode="numeric" placeholder="예: 180" step="1" min="120" max="220">
+          <span class="unit">SPM</span>
+        </div>
+        <p class="hint">입력하면 측정 후 "현재 → 목표 · 차이"를 보여줘요. 비우면 추천값(+5~10%)을 자동 사용합니다.</p>
+      </div>
     </div>
 
     <div class="card">
@@ -139,17 +147,10 @@
       <div style="text-align:center; margin-top:8px;"><span class="chip" id="crossWarn" style="display:none; color:#fca5a5; background:rgba(248,113,113,.09); border-color:rgba(248,113,113,.4); line-height:1.5; white-space:normal;"></span></div>
     </div>
     <div class="card">
-      <p class="label" style="text-align:center; margin-bottom:4px;">권장 목표 (현재의 +5~10%)</p>
+      <p class="label" id="targetLabel" style="text-align:center; margin-bottom:4px;">권장 목표 (현재의 +5~10%)</p>
       <div class="target"><span class="t" id="targetRange">—</span></div>
       <p class="hint" id="targetNote" style="text-align:center;"></p>
-      <div style="border-top:1px solid var(--line); margin-top:14px; padding-top:14px;">
-        <p class="label" style="text-align:center; margin:0 0 9px;">🎯 내 목표 케이던스 (선택)</p>
-        <div class="row" style="display:flex; gap:10px; align-items:center;">
-          <input type="number" id="userTargetInput" inputmode="numeric" placeholder="예: 180" step="1" min="120" max="220">
-          <span class="unit">SPM</span>
-        </div>
-        <p class="hint" id="userTargetNote" style="text-align:center; margin-top:10px;"></p>
-      </div>
+      <p class="hint" id="userTargetNote" style="text-align:center; margin-top:10px;"></p>
     </div>
     <div class="card" id="summaryCard">
       <p class="label" style="text-align:center; margin-bottom:6px;">🧭 종합 코멘트</p>
@@ -1743,32 +1744,34 @@ function buildSummary(res, over, trunk, vo, cadenceLow){
   return bits.join(' · ')+' — 케이던스를 5%씩 점진적으로 올리며 자세를 함께 다듬어 보세요.';
 }
 
-// --- Optional user target cadence: compare current vs goal, direction-aware guidance. ---
-// Missing input -> recommended (+5~10%) range stays in effect; metronome uses recommended.
+// Target cadence is entered on the SETUP screen (before upload) and kept in State
+// through analysis. This just mirrors the input into State; null when empty/invalid.
+function readUserTarget(){
+  var v=parseInt($('userTargetInput').value,10);
+  State.userTarget=(isFinite(v) && v>0) ? v : null;
+}
+$('userTargetInput').addEventListener('input', readUserTarget);
+
+// --- Result-side: compare measured cadence vs the entered goal, direction-aware. ---
+// No goal -> hide this note; showResult keeps the recommended (+5~10%) fallback.
 function renderUserTarget(){
-  var el=$('userTargetNote'), v=parseInt($('userTargetInput').value,10);
-  if(!isFinite(v) || v<=0){
-    State.userTarget=null;
-    el.textContent='비워두면 위 권장 목표를 사용해요. 연습 모드 메트로놈에도 이 값이 적용됩니다.';
-    el.style.color='var(--muted)';
-    return;
-  }
-  State.userTarget=v;
+  var el=$('userTargetNote'), v=State.userTarget;
+  if(!isFinite(v) || v<=0){ el.textContent=''; el.style.display='none'; return; }
+  el.style.display='';
   var cur=State.spm, diff=v-cur, ad=Math.abs(diff);
-  var head='현재 '+cur+' → 목표 '+v+' · 차이 '+(diff>=0?'+':'−')+ad+' SPM. ';
+  var head='현재 '+cur+' SPM → 목표 '+v+' SPM · 차이 '+(diff>=0?'+':'−')+ad+' SPM. ';
   var msg, color;
   if(ad<=3){
     msg='거의 목표에 도달했어요 — 지금 리듬을 유지하세요.'; color='var(--good)';
   } else if(diff>0){
-    msg='목표까지 +'+ad+' SPM. 한 번에 5%씩 천천히 올리세요 — 부하가 종아리·아킬레스로 옮겨가니 몇 주에 걸쳐 점진적으로.'; color='var(--accent)';
+    msg='목표까지 +'+ad+' SPM — 한 번에 5%씩 천천히 올리세요 (부하가 종아리·아킬레스로 옮겨가니 몇 주에 걸쳐 점진적으로).'; color='var(--accent)';
   } else if(State.cadenceOk){
-    msg='현재도 양호해요 — 케이던스를 낮추는 건 보통 권장되지 않아요. 목표를 다시 확인해보세요.'; color='var(--accent2)';
+    msg='현재도 양호해요 — 낮출 필요는 없어요. 목표를 다시 확인해보세요.'; color='var(--accent2)';
   } else {
     msg='목표가 현재보다 낮아요. 특별한 이유가 없다면 케이던스를 낮추기보다 유지·소폭 상향을 권장해요.'; color='var(--accent2)';
   }
   el.textContent=head+msg; el.style.color=color;
 }
-$('userTargetInput').addEventListener('input', renderUserTarget);
 
 function showResult(res, over, trunk, vo){
   showScreen('result');
@@ -1796,15 +1799,23 @@ function showResult(res, over, trunk, vo){
   }
   v.textContent=txt; v.className='verdict '+cls;
 
-  // target = +5~10%
+  // recommended (+5~10%) — the fallback when no goal was entered on setup
   var lo=Math.round(res.spm*1.05), hi=Math.round(res.spm*1.10);
-  $('targetRange').textContent = lo+'–'+hi+' SPM';
-  $('targetNote').textContent = (cls==='low')
-    ? '낮은 편이니 위 범위를 목표로, 한 번에 5%씩 올려보세요.'
-    : '이미 양호합니다. 더 높일 필요는 없어요 — 효율을 시험하고 싶을 때만 +5%.';
   State.targetBpm = lo;
   State.cadenceOk = (cls==='ok');
-  State.userTarget = null; $('userTargetInput').value=''; renderUserTarget();
+  if(isFinite(State.userTarget) && State.userTarget>0){
+    // goal entered before upload -> show it in place of the recommendation + comparison
+    $('targetLabel').textContent = '🎯 목표 케이던스 (입력값)';
+    $('targetRange').textContent = State.userTarget + ' SPM';
+    $('targetNote').textContent = '';
+  } else {
+    $('targetLabel').textContent = '권장 목표 (현재의 +5~10%)';
+    $('targetRange').textContent = lo+'–'+hi+' SPM';
+    $('targetNote').textContent = (cls==='low')
+      ? '낮은 편이니 위 범위를 목표로, 한 번에 5%씩 올려보세요.'
+      : '이미 양호합니다. 더 높일 필요는 없어요 — 효율을 시험하고 싶을 때만 +5%.';
+  }
+  renderUserTarget();
   // --- trunk lean + vertical oscillation (reliable) ---
   renderTrunk(trunk);
   renderVO(vo);
