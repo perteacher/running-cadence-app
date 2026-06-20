@@ -478,9 +478,11 @@
     }
     const leanDeg = Math.round(median(angles) * 10) / 10;
 
+    // Dead-zone: an upright torso (small +/- angle) is NORMAL. Only a clear backward
+    // lean is flagged. This is torso lean (shoulder->hip), NOT whole-body lean-from-ankle.
     let classification;
-    if (leanDeg < 2)        classification = 'upright';     // too upright / leaning back
-    else if (leanDeg <= 12) classification = 'good';        // ~2-10 ideal (research), up to 12 ok
+    if (leanDeg < -3)       classification = 'back';        // clearly leaning back -> nudge forward
+    else if (leanDeg <= 12) classification = 'good';        // -3..+12 = upright/natural torso, fine
     else                    classification = 'excessive';   // >12 over-lean / hip-flexion
 
     let confidence;
@@ -491,7 +493,77 @@
     return { leanDeg, classification, confidence, frameCount: angles.length };
   }
 
-  const CadenceCore = { computeSPM, computeOverstride, computeTrunkLean, lowpass, detrend, findPeaks, autocorr };
+  // --- Vertical oscillation (hip bounce), scale-free ---
+  // amplitude = robust peak-to-peak (p95-p5) of the DETRENDED hipMidY, in pixels,
+  // normalized by torso length (|shoulder-hip|) => % independent of camera distance/zoom.
+  // Whole-clip based => deterministic & robust.
+  function computeVerticalOscillation(samples, dims) {
+    const { w, h } = dims;
+    const { hipMidX, hipMidY, shoulderMidX, shoulderMidY, hipVis, shoulderVis, tMs } = samples;
+    const n = (hipMidY && hipMidY.length) || 0;
+
+    // fps from timestamps (fallback 30)
+    let fps = 30;
+    if (tMs && tMs.length > 2) {
+      const diffs = [];
+      for (let i = 1; i < tMs.length; i++) { const d = tMs[i] - tMs[i - 1]; if (d > 0) diffs.push(d); }
+      if (diffs.length) fps = 1000 / median(diffs);
+    }
+
+    const VIS = 0.5;
+    const hipSeries = [], torso = [];
+    for (let i = 0; i < n; i++) {
+      const hy = hipMidY && hipMidY[i], hx = hipMidX && hipMidX[i];
+      const hv = hipVis && hipVis[i];
+      if (!Number.isFinite(hy)) continue;
+      if (Number.isFinite(hv) && hv < VIS) continue;
+      hipSeries.push(hy);
+      const sy = shoulderMidY && shoulderMidY[i], sx = shoulderMidX && shoulderMidX[i];
+      const sv = shoulderVis && shoulderVis[i];
+      if (Number.isFinite(sy) && Number.isFinite(sx) && Number.isFinite(hx) &&
+          (!Number.isFinite(sv) || sv >= VIS)) {
+        const dxpx = (sx - hx) * w, dypx = (sy - hy) * h;
+        torso.push(Math.sqrt(dxpx * dxpx + dypx * dypx));
+      }
+    }
+
+    if (hipSeries.length < 10 || torso.length < 3) {
+      return { ratioPct: null, ampPx: null, torsoPx: null, classification: 'unknown', confidence: 'low', frameCount: hipSeries.length };
+    }
+
+    // detrend out slow vertical drift / panning, then robust peak-to-peak amplitude.
+    const detr = detrend(hipSeries, fps, 1.0);
+    function pct(arr, p) {
+      const s = arr.slice().sort((a, b) => a - b);
+      const idx = Math.min(s.length - 1, Math.max(0, Math.round((p / 100) * (s.length - 1))));
+      return s[idx];
+    }
+    const ampPx   = (pct(detr, 95) - pct(detr, 5)) * h;
+    const torsoPx = median(torso);
+    const ratioPct = torsoPx > 0 ? Math.round((ampPx / torsoPx) * 1000) / 10 : null;
+
+    if (ratioPct == null) {
+      return { ratioPct: null, ampPx: null, torsoPx: null, classification: 'unknown', confidence: 'low', frameCount: hipSeries.length };
+    }
+
+    // Provisional bands (to be calibrated on real data, like the cadence intercept).
+    let classification;
+    if (ratioPct < 16)       classification = 'low';     // economical
+    else if (ratioPct <= 22) classification = 'normal';
+    else                     classification = 'high';    // bouncy
+
+    let confidence;
+    if (hipSeries.length >= 60)      confidence = 'high';
+    else if (hipSeries.length >= 20) confidence = 'medium';
+    else                             confidence = 'low';
+
+    return {
+      ratioPct, ampPx: Math.round(ampPx), torsoPx: Math.round(torsoPx),
+      classification, confidence, frameCount: hipSeries.length
+    };
+  }
+
+  const CadenceCore = { computeSPM, computeOverstride, computeTrunkLean, computeVerticalOscillation, lowpass, detrend, findPeaks, autocorr };
 
   // --- Self-test (Node only) ---
   if (typeof require !== 'undefined' && require.main === module) {
@@ -868,6 +940,60 @@
       const ok = fwdR.leanDeg > 0 && fwdL.leanDeg > 0 &&
                  Math.abs(fwdR.leanDeg - fwdL.leanDeg) <= 0.2 && back.leanDeg < 0;
       console.log(`${ok ? 'PASS' : 'FAIL'} TL-c: fwdR=${fwdR.leanDeg}° fwdL=${fwdL.leanDeg}° back=${back.leanDeg}°`);
+    }
+
+    // (TL-d) dead-zone: a near-vertical torso (-2.2deg) must classify 'good', not 'back'.
+    {
+      const n=40;
+      const s={ shoulderMidX:[], shoulderMidY:[], hipMidX:[], hipMidY:[], shoulderVis:[], hipVis:[] };
+      // tan(2.2deg)=0.03843 -> dx = -0.03843*200 = -7.686px -> (sx-hx) = -0.007686 at w=1000
+      for(let i=0;i<n;i++){ const hipx=0.30+0.005*i;
+        s.hipMidX.push(hipx); s.hipMidY.push(0.60);
+        s.shoulderMidX.push(hipx - 0.007686); s.shoulderMidY.push(0.40);
+        s.shoulderVis.push(0.9); s.hipVis.push(0.9); }
+      const r = CadenceCore.computeTrunkLean(s, { w:1000, h:1000 });
+      const ok = Math.abs(r.leanDeg - (-2.2)) <= 0.3 && r.classification === 'good';
+      console.log(`${ok ? 'PASS' : 'FAIL'} TL-d deadzone: leanDeg=${r.leanDeg}° class=${r.classification}`);
+    }
+
+    // --- Vertical oscillation ---
+    function genVO(n, fps, A, driftAmp, torsoNorm){
+      const s={ hipMidY:[], hipMidX:[], shoulderMidY:[], shoulderMidX:[], hipVis:[], shoulderVis:[], tMs:[] };
+      for(let i=0;i<n;i++){
+        const t=i/fps; s.tMs.push(t*1000);
+        const drift = driftAmp*(i/(n-1));
+        const hy = 0.50 + A*Math.sin(2*Math.PI*1.5*t) + drift;
+        s.hipMidY.push(hy); s.hipMidX.push(0.50);
+        s.shoulderMidY.push(hy - torsoNorm); s.shoulderMidX.push(0.50);  // pure-vertical torso
+        s.hipVis.push(0.9); s.shoulderVis.push(0.9);
+      }
+      return s;
+    }
+
+    // (VO-a) amplitude linearity: doubling hip bounce ~doubles the ratio.
+    {
+      const r1 = CadenceCore.computeVerticalOscillation(genVO(300,30,0.03,0,0.20), { w:1000, h:1000 });
+      const r2 = CadenceCore.computeVerticalOscillation(genVO(300,30,0.06,0,0.20), { w:1000, h:1000 });
+      const lin = Math.abs(r2.ratioPct - 2*r1.ratioPct) <= 0.05*2*r1.ratioPct;
+      const ok = r1.ratioPct > 0 && lin && r1.classification !== 'unknown' && r2.classification !== 'unknown';
+      console.log(`${ok ? 'PASS' : 'FAIL'} VO-a: r1=${r1.ratioPct}%(${r1.classification}) r2=${r2.ratioPct}% linear=${lin}`);
+    }
+
+    // (VO-b) drift invariance: detrend removes slow pan, ratio stays put.
+    {
+      const noDrift = CadenceCore.computeVerticalOscillation(genVO(300,30,0.03,0,   0.20), { w:1000, h:1000 });
+      const drift   = CadenceCore.computeVerticalOscillation(genVO(300,30,0.03,0.10,0.20), { w:1000, h:1000 });
+      const ok = Math.abs(noDrift.ratioPct - drift.ratioPct) <= 1.0;
+      console.log(`${ok ? 'PASS' : 'FAIL'} VO-b: noDrift=${noDrift.ratioPct}% drift=${drift.ratioPct}% (Δ≤1%p)`);
+    }
+
+    // (VO-c) scale invariance: same normalized coords, different frameH -> same ratio.
+    {
+      const s = genVO(300,30,0.03,0,0.20);
+      const rA = CadenceCore.computeVerticalOscillation(s, { w:720,  h:720  });
+      const rB = CadenceCore.computeVerticalOscillation(s, { w:1440, h:1440 });
+      const ok = Math.abs(rA.ratioPct - rB.ratioPct) <= 0.2;
+      console.log(`${ok ? 'PASS' : 'FAIL'} VO-c: h720=${rA.ratioPct}% h1440=${rB.ratioPct}% (scale-free)`);
     }
   }
 

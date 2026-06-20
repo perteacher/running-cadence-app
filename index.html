@@ -143,11 +143,18 @@
       <p class="hint" id="targetNote" style="text-align:center;"></p>
     </div>
     <div class="card" id="trunkCard">
-      <p class="label" style="text-align:center; margin-bottom:4px;">상체 전경각 (어깨–엉덩이) <span class="tag rel">신뢰</span></p>
+      <p class="label" style="text-align:center; margin-bottom:4px;">상체(몸통) 기울기 <span class="tag rel">신뢰</span></p>
       <div class="bignum" style="font-size:48px;"><span id="trunkVal">—</span><small>°</small></div>
       <div class="verdict" id="trunkVerdict"></div>
-      <p class="hint" id="trunkCue" style="text-align:center;">발목부터 몸 전체로 살짝 앞으로 — 허리만 굽히지 마세요.</p>
-      <p class="hint" id="trunkNote" style="text-align:center; font-size:11px; color:#6b7785;">※ 카메라가 수평·정측면일 때 정확합니다. 기울면 값이 편향돼요.</p>
+      <p class="hint" id="trunkCue" style="text-align:center;">몸통은 곧게 — 과하게 앞으로 굽히거나 뒤로 젖히지 마세요.</p>
+      <p class="hint" id="trunkNote" style="text-align:center; font-size:11px; color:#6b7785;">※ 몸통(어깨–엉덩이) 기울기예요 — 발목부터의 전신 기울기와는 다릅니다. 몸통은 곧게가 정상. 카메라가 수평·정측면일 때 정확.</p>
+    </div>
+    <div class="card" id="voCard">
+      <p class="label" style="text-align:center; margin-bottom:4px;">수직 진동 (엉덩이 상하) <span class="tag rel">신뢰</span></p>
+      <div class="bignum" style="font-size:48px;"><span id="voVal">—</span><small>%</small></div>
+      <div class="verdict" id="voVerdict"></div>
+      <p class="hint" id="voCue" style="text-align:center;">위아래 출렁임을 줄이고 앞으로 — 케이던스를 올리면 같이 줄어요.</p>
+      <p class="hint" id="voNote" style="text-align:center; font-size:11px; color:#6b7785;">※ 몸통길이 대비 상하 진폭(%). 측정값은 신뢰, 판정 기준은 잠정 — 보정 예정.</p>
     </div>
     <div class="card" id="overCard">
       <p class="label" style="text-align:center; margin-bottom:4px;">오버스트라이드 (정강이각) <span class="tag exp">참고·실험적</span></p>
@@ -667,9 +674,11 @@
     }
     const leanDeg = Math.round(median(angles) * 10) / 10;
 
+    // Dead-zone: an upright torso (small +/- angle) is NORMAL. Only a clear backward
+    // lean is flagged. This is torso lean (shoulder->hip), NOT whole-body lean-from-ankle.
     let classification;
-    if (leanDeg < 2)        classification = 'upright';     // too upright / leaning back
-    else if (leanDeg <= 12) classification = 'good';        // ~2-10 ideal (research), up to 12 ok
+    if (leanDeg < -3)       classification = 'back';        // clearly leaning back -> nudge forward
+    else if (leanDeg <= 12) classification = 'good';        // -3..+12 = upright/natural torso, fine
     else                    classification = 'excessive';   // >12 over-lean / hip-flexion
 
     let confidence;
@@ -680,7 +689,77 @@
     return { leanDeg, classification, confidence, frameCount: angles.length };
   }
 
-  const CadenceCore = { computeSPM, computeOverstride, computeTrunkLean, lowpass, detrend, findPeaks, autocorr };
+  // --- Vertical oscillation (hip bounce), scale-free ---
+  // amplitude = robust peak-to-peak (p95-p5) of the DETRENDED hipMidY, in pixels,
+  // normalized by torso length (|shoulder-hip|) => % independent of camera distance/zoom.
+  // Whole-clip based => deterministic & robust.
+  function computeVerticalOscillation(samples, dims) {
+    const { w, h } = dims;
+    const { hipMidX, hipMidY, shoulderMidX, shoulderMidY, hipVis, shoulderVis, tMs } = samples;
+    const n = (hipMidY && hipMidY.length) || 0;
+
+    // fps from timestamps (fallback 30)
+    let fps = 30;
+    if (tMs && tMs.length > 2) {
+      const diffs = [];
+      for (let i = 1; i < tMs.length; i++) { const d = tMs[i] - tMs[i - 1]; if (d > 0) diffs.push(d); }
+      if (diffs.length) fps = 1000 / median(diffs);
+    }
+
+    const VIS = 0.5;
+    const hipSeries = [], torso = [];
+    for (let i = 0; i < n; i++) {
+      const hy = hipMidY && hipMidY[i], hx = hipMidX && hipMidX[i];
+      const hv = hipVis && hipVis[i];
+      if (!Number.isFinite(hy)) continue;
+      if (Number.isFinite(hv) && hv < VIS) continue;
+      hipSeries.push(hy);
+      const sy = shoulderMidY && shoulderMidY[i], sx = shoulderMidX && shoulderMidX[i];
+      const sv = shoulderVis && shoulderVis[i];
+      if (Number.isFinite(sy) && Number.isFinite(sx) && Number.isFinite(hx) &&
+          (!Number.isFinite(sv) || sv >= VIS)) {
+        const dxpx = (sx - hx) * w, dypx = (sy - hy) * h;
+        torso.push(Math.sqrt(dxpx * dxpx + dypx * dypx));
+      }
+    }
+
+    if (hipSeries.length < 10 || torso.length < 3) {
+      return { ratioPct: null, ampPx: null, torsoPx: null, classification: 'unknown', confidence: 'low', frameCount: hipSeries.length };
+    }
+
+    // detrend out slow vertical drift / panning, then robust peak-to-peak amplitude.
+    const detr = detrend(hipSeries, fps, 1.0);
+    function pct(arr, p) {
+      const s = arr.slice().sort((a, b) => a - b);
+      const idx = Math.min(s.length - 1, Math.max(0, Math.round((p / 100) * (s.length - 1))));
+      return s[idx];
+    }
+    const ampPx   = (pct(detr, 95) - pct(detr, 5)) * h;
+    const torsoPx = median(torso);
+    const ratioPct = torsoPx > 0 ? Math.round((ampPx / torsoPx) * 1000) / 10 : null;
+
+    if (ratioPct == null) {
+      return { ratioPct: null, ampPx: null, torsoPx: null, classification: 'unknown', confidence: 'low', frameCount: hipSeries.length };
+    }
+
+    // Provisional bands (to be calibrated on real data, like the cadence intercept).
+    let classification;
+    if (ratioPct < 16)       classification = 'low';     // economical
+    else if (ratioPct <= 22) classification = 'normal';
+    else                     classification = 'high';    // bouncy
+
+    let confidence;
+    if (hipSeries.length >= 60)      confidence = 'high';
+    else if (hipSeries.length >= 20) confidence = 'medium';
+    else                             confidence = 'low';
+
+    return {
+      ratioPct, ampPx: Math.round(ampPx), torsoPx: Math.round(torsoPx),
+      classification, confidence, frameCount: hipSeries.length
+    };
+  }
+
+  const CadenceCore = { computeSPM, computeOverstride, computeTrunkLean, computeVerticalOscillation, lowpass, detrend, findPeaks, autocorr };
 
   // --- Self-test (Node only) ---
   if (typeof require !== 'undefined' && require.main === module) {
@@ -1481,7 +1560,8 @@ async function runCapture(live, maxSec){
   var dims = { w: S.frameW || video.videoWidth || 1, h: S.frameH || video.videoHeight || 1 };
   var over = window.CadenceCore.computeOverstride(S, res.peaks, dims);
   var trunk = window.CadenceCore.computeTrunkLean(S, dims);
-  showResult(res, over, trunk);
+  var vo = window.CadenceCore.computeVerticalOscillation(S, dims);
+  showResult(res, over, trunk, vo);
 }
 
 /* ---------- Result ---------- */
@@ -1511,8 +1591,8 @@ function renderTrunk(trunk){
   if(trunk && trunk.leanDeg != null && trunk.classification !== 'unknown'){
     $('trunkVal').textContent = trunk.leanDeg.toFixed(1);
     var t, cls;
-    if(trunk.classification==='good'){ t='양호 — 살짝 앞으로 기운 효율적 자세'; cls='ok'; }
-    else if(trunk.classification==='upright'){ t='너무 곧음/뒤로 젖혀짐 — 살짝 앞으로 기울이세요'; cls='low'; }
+    if(trunk.classification==='good'){ t='양호 — 몸통이 곧고 자연스러움'; cls='ok'; }
+    else if(trunk.classification==='back'){ t='뒤로 젖혀짐 — 살짝 앞으로 기울이세요'; cls='low'; }
     else { t='과도하게 앞으로 — 허리만 굽히는지 확인하세요'; cls='low'; }
     if(trunk.confidence==='low'){ t += ' (인식 프레임 적음, 참고)'; }
     v.textContent=t; v.className='verdict '+cls;
@@ -1525,7 +1605,27 @@ function renderTrunk(trunk){
   }
 }
 
-function showResult(res, over, trunk){
+// Vertical oscillation — reliable, scale-free metric.
+function renderVO(vo){
+  var v=$('voVerdict');
+  if(vo && vo.ratioPct != null && vo.classification !== 'unknown'){
+    $('voVal').textContent = vo.ratioPct.toFixed(1);
+    var t, cls;
+    if(vo.classification==='low'){ t='낮음 — 경제적인 주법'; cls='ok'; }
+    else if(vo.classification==='normal'){ t='보통'; cls='ok'; }
+    else { t='높음 — 위아래 출렁임이 큼'; cls='low'; }
+    if(vo.confidence==='low'){ t += ' (인식 프레임 적음, 참고)'; }
+    v.textContent=t; v.className='verdict '+cls;
+    $('voCue').style.display='';
+  } else {
+    $('voVal').textContent='—';
+    v.textContent='엉덩이·어깨 인식이 부족해 수직 진동을 못 쟀어요 — 측면·전신·밝게 다시 촬영';
+    v.className='verdict low';
+    $('voCue').style.display='none';
+  }
+}
+
+function showResult(res, over, trunk, vo){
   showScreen('result');
   $('spmVal').textContent = res.spm;
   var confMap={high:'신뢰도 높음', medium:'신뢰도 보통', low:'신뢰도 낮음 — 다시 측정 권장'};
@@ -1558,8 +1658,9 @@ function showResult(res, over, trunk){
     ? '낮은 편이니 위 범위를 목표로, 한 번에 5%씩 올려보세요.'
     : '이미 양호합니다. 더 높일 필요는 없어요 — 효율을 시험하고 싶을 때만 +5%.';
   State.targetBpm = lo;
-  // --- trunk forward lean (reliable) ---
+  // --- trunk lean + vertical oscillation (reliable) ---
   renderTrunk(trunk);
+  renderVO(vo);
   // --- overstride (정강이각) — experimental, reference only ---
   if(over && over.shinAngleDeg != null && over.classification !== 'unknown'){
     $('shinVal').textContent = over.shinAngleDeg.toFixed(1);
