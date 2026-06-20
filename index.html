@@ -136,11 +136,24 @@
       <div class="bignum"><span id="spmVal">—</span><small> SPM</small></div>
       <div class="verdict" id="verdict"></div>
       <div style="text-align:center;"><span class="chip" id="confChip"></span></div>
+      <div style="text-align:center; margin-top:8px;"><span class="chip" id="crossWarn" style="display:none; color:#fca5a5; background:rgba(248,113,113,.09); border-color:rgba(248,113,113,.4); line-height:1.5; white-space:normal;"></span></div>
     </div>
     <div class="card">
       <p class="label" style="text-align:center; margin-bottom:4px;">권장 목표 (현재의 +5~10%)</p>
       <div class="target"><span class="t" id="targetRange">—</span></div>
       <p class="hint" id="targetNote" style="text-align:center;"></p>
+      <div style="border-top:1px solid var(--line); margin-top:14px; padding-top:14px;">
+        <p class="label" style="text-align:center; margin:0 0 9px;">🎯 내 목표 케이던스 (선택)</p>
+        <div class="row" style="display:flex; gap:10px; align-items:center;">
+          <input type="number" id="userTargetInput" inputmode="numeric" placeholder="예: 180" step="1" min="120" max="220">
+          <span class="unit">SPM</span>
+        </div>
+        <p class="hint" id="userTargetNote" style="text-align:center; margin-top:10px;"></p>
+      </div>
+    </div>
+    <div class="card" id="summaryCard">
+      <p class="label" style="text-align:center; margin-bottom:6px;">🧭 종합 코멘트</p>
+      <p class="hint" id="summaryText" style="text-align:center; color:var(--txt); font-size:14px; margin:0; line-height:1.7;"></p>
     </div>
     <div class="card" id="trunkCard">
       <p class="label" style="text-align:center; margin-bottom:4px;">상체(몸통) 기울기 <span class="tag rel">신뢰</span></p>
@@ -405,11 +418,24 @@
     const ac = autocorr(useSig);
     const minLag = Math.round(fps * 0.25); // shortest plausible stride ~240 spm
     const maxLag = Math.round(fps * 1.5);  // longest plausible stride ~40 spm
+    const hiLag = Math.min(maxLag, ac.length - 1);
     let bestLag = minLag, bestAC = -Infinity;
-    for (let lag = minLag; lag <= Math.min(maxLag, ac.length - 1); lag++) {
+    for (let lag = minLag; lag <= hiLag; lag++) {
       if (ac[lag] > bestAC) { bestAC = ac[lag]; bestLag = lag; }
     }
-    const spmAuto = bestLag > 0 ? (fps / bestLag) * 60 * 2 : 0;
+    // Parabolic (3-point) interpolation of the autocorr peak -> sub-sample lag.
+    // Integer lags quantize cadence (e.g. ~189.5 vs 200 SPM across the lag boundary),
+    // so the same clip can jump between runs; the refined lag smooths that out.
+    // Skip at the search-window edges where a 3-point fit isn't defined.
+    let refinedLag = bestLag;
+    if (bestLag > minLag && bestLag < hiLag) {
+      const am1 = ac[bestLag - 1], a0 = ac[bestLag], ap1 = ac[bestLag + 1];
+      const denom = am1 - 2 * a0 + ap1;
+      let delta = denom !== 0 ? 0.5 * (am1 - ap1) / denom : 0;
+      delta = Math.max(-1, Math.min(1, delta));
+      refinedLag = bestLag + delta;
+    }
+    const spmAuto = refinedLag > 0 ? (fps / refinedLag) * 60 * 2 : 0;
 
     // 8. Choose method — cross-validate peak detection against autocorrelation
     //    to catch double-counting (spurious peaks => spmPeak ~2x the true cadence).
@@ -1343,7 +1369,7 @@ function createMetronome(){
 }
 
 /* ---------- App state + helpers ---------- */
-var State = { mode:'treadmill', paceSpeed:null, paceUnit:'kmh', paceRaw:null, spm:null, targetBpm:null };
+var State = { mode:'treadmill', paceSpeed:null, paceUnit:'kmh', paceRaw:null, spm:null, targetBpm:null, userTarget:null, cadenceOk:false };
 var metro = createMetronome();
 
 function $(id){ return document.getElementById(id); }
@@ -1625,6 +1651,102 @@ function renderVO(vo){
   }
 }
 
+// --- Cross-metric consistency check (DISPLAY ONLY — never alters measured values) ---
+// Relationships: cadence↑→VO↓·overstride↓ ; overstride↑→VO↑ ; trunk straight/back→overstride↑.
+// Flag ONLY on clear contradictions (kept loose to avoid false positives), then lower the
+// DISPLAYED confidence and show a badge. The numbers themselves stay untouched.
+function crossCheck(res, over, trunk, vo){
+  var flags=[], hit={cadence:false, vo:false, over:false};
+  // (1) high cadence yet large vertical bounce — physically opposed
+  if(vo && vo.ratioPct!=null && res.spm>195 && vo.ratioPct>22){
+    flags.push('케이던스 높음(>195)인데 수직 진동도 큼(>22%)');
+    hit.cadence=true; hit.vo=true;
+  }
+  // (2) the two cadence estimators disagree by >12% (classic double-count / dropped frames)
+  var d=res.debug, dev=d?d.peakAutoDev:Infinity;
+  if(d && isFinite(dev) && dev>0.12 && d.spmPeak>120 && d.spmAuto>120){
+    flags.push('케이던스 피크검출·주파수분석 '+Math.round(dev*100)+'% 불일치');
+    hit.cadence=true;
+  }
+  return { flags:flags, hit:hit };
+}
+function applyCrossCheck(res, over, trunk, vo){
+  var xc=crossCheck(res, over, trunk, vo), cw=$('crossWarn');
+  if(xc.flags.length){
+    cw.style.display='';
+    cw.textContent='⚠ 지표 간 불일치 — 재측정 권장 ('+xc.flags.join(' · ')+')';
+    if(xc.hit.cadence){ $('confChip').textContent += ' · 신뢰도↓(불일치)'; }
+    if(xc.hit.vo){
+      var vv=$('voVerdict');
+      if(vv.textContent && vv.textContent.indexOf('불일치')<0){ vv.textContent += ' · 지표 불일치(참고)'; }
+    }
+  } else {
+    cw.style.display='none'; cw.textContent='';
+  }
+}
+
+// --- Root-cause summary: one synthesized comment across all metrics. ---
+// Principle: relative +5~10% & gradual; overstride stays REFERENCE-only (never a verdict).
+function buildSummary(res, over, trunk, vo, cadenceLow){
+  var voHigh    = vo   && vo.classification==='high';
+  var voOk      = vo   && (vo.classification==='low' || vo.classification==='normal');
+  var overTend  = over && (over.classification==='borderline' || over.classification==='overstride');
+  var trunkBack = trunk && trunk.classification==='back';
+  var trunkExc  = trunk && trunk.classification==='excessive';
+  var trunkOkish= !trunk || trunk.classification==='good' || trunk.classification==='unknown';
+
+  if(cadenceLow && voHigh && overTend){
+    return '세 지표(낮은 케이던스·큰 상하 출렁임·앞쪽 착지 경향)가 한 뿌리 — 보폭 과다로 보여요. 케이던스부터 5%씩 천천히 올리면 나머지도 함께 줄어듭니다. (오버스트라이드는 참고용)';
+  }
+  if(trunkBack && overTend){
+    return '몸통이 뒤로 젖혀지며 발이 앞서 닿는 경향이에요 — 발목부터 살짝 앞으로 기울여 무게중심 아래에서 착지하고, 케이던스를 5%씩 올려보세요. (오버스트라이드는 참고용)';
+  }
+  if(cadenceLow && voHigh){
+    return '케이던스가 낮고 상하 출렁임이 커요 — 케이던스부터 한 번에 5%씩 올리면 수직 진동도 함께 줄어듭니다.';
+  }
+  if(cadenceLow){
+    return '케이던스가 낮은 편이에요 — 한 번에 5%씩, 몇 주에 걸쳐 점진적으로 올려보세요.';
+  }
+  if(!cadenceLow && voOk && trunkOkish && !overTend){
+    return '전반적으로 좋은 폼이에요 — 지금 리듬과 자세를 유지하세요.';
+  }
+  // mixed/other: targeted but mild
+  var bits=[];
+  if(voHigh)    bits.push('상하 출렁임이 큰 편');
+  if(trunkBack) bits.push('몸통이 살짝 뒤로');
+  if(trunkExc)  bits.push('몸통이 과하게 앞으로');
+  if(overTend)  bits.push('앞쪽 착지 경향(참고)');
+  if(bits.length===0){ return '대체로 양호해요 — 현재 리듬을 유지하면서 케이던스는 필요할 때만 +5%.'; }
+  return bits.join(' · ')+' — 케이던스를 5%씩 점진적으로 올리며 자세를 함께 다듬어 보세요.';
+}
+
+// --- Optional user target cadence: compare current vs goal, direction-aware guidance. ---
+// Missing input -> recommended (+5~10%) range stays in effect; metronome uses recommended.
+function renderUserTarget(){
+  var el=$('userTargetNote'), v=parseInt($('userTargetInput').value,10);
+  if(!isFinite(v) || v<=0){
+    State.userTarget=null;
+    el.textContent='비워두면 위 권장 목표를 사용해요. 연습 모드 메트로놈에도 이 값이 적용됩니다.';
+    el.style.color='var(--muted)';
+    return;
+  }
+  State.userTarget=v;
+  var cur=State.spm, diff=v-cur, ad=Math.abs(diff);
+  var head='현재 '+cur+' → 목표 '+v+' · 차이 '+(diff>=0?'+':'−')+ad+' SPM. ';
+  var msg, color;
+  if(ad<=3){
+    msg='거의 목표에 도달했어요 — 지금 리듬을 유지하세요.'; color='var(--good)';
+  } else if(diff>0){
+    msg='목표까지 +'+ad+' SPM. 한 번에 5%씩 천천히 올리세요 — 부하가 종아리·아킬레스로 옮겨가니 몇 주에 걸쳐 점진적으로.'; color='var(--accent)';
+  } else if(State.cadenceOk){
+    msg='현재도 양호해요 — 케이던스를 낮추는 건 보통 권장되지 않아요. 목표를 다시 확인해보세요.'; color='var(--accent2)';
+  } else {
+    msg='목표가 현재보다 낮아요. 특별한 이유가 없다면 케이던스를 낮추기보다 유지·소폭 상향을 권장해요.'; color='var(--accent2)';
+  }
+  el.textContent=head+msg; el.style.color=color;
+}
+$('userTargetInput').addEventListener('input', renderUserTarget);
+
 function showResult(res, over, trunk, vo){
   showScreen('result');
   $('spmVal').textContent = res.spm;
@@ -1658,6 +1780,8 @@ function showResult(res, over, trunk, vo){
     ? '낮은 편이니 위 범위를 목표로, 한 번에 5%씩 올려보세요.'
     : '이미 양호합니다. 더 높일 필요는 없어요 — 효율을 시험하고 싶을 때만 +5%.';
   State.targetBpm = lo;
+  State.cadenceOk = (cls==='ok');
+  State.userTarget = null; $('userTargetInput').value=''; renderUserTarget();
   // --- trunk lean + vertical oscillation (reliable) ---
   renderTrunk(trunk);
   renderVO(vo);
@@ -1683,6 +1807,9 @@ function showResult(res, over, trunk, vo){
     $('overSynergy').textContent = '';
   }
   renderOverDebug(over);
+  // cross-metric consistency (display only) + root-cause synthesis
+  applyCrossCheck(res, over, trunk, vo);
+  $('summaryText').textContent = buildSummary(res, over, trunk, vo, cls==='low');
 }
 
 $('btnAgain').addEventListener('click', function(){ showScreen('setup'); });
@@ -1691,7 +1818,8 @@ $('btnPractice').addEventListener('click', function(){ openPractice(); });
 /* ---------- Practice (metronome) ---------- */
 function openPractice(){
   showScreen('practice');
-  var bpm = State.targetBpm || (State.spm? Math.round(State.spm*1.05):170);
+  // user-entered target wins; else recommended (+5%); else fallback.
+  var bpm = State.userTarget || State.targetBpm || (State.spm? Math.round(State.spm*1.05):170);
   setBpmUI(bpm);
   metro.onBeat(function(){
     var c=$('beatCircle'); c.classList.add('flash'); setTimeout(function(){ c.classList.remove('flash'); }, 70);

@@ -209,11 +209,24 @@
     const ac = autocorr(useSig);
     const minLag = Math.round(fps * 0.25); // shortest plausible stride ~240 spm
     const maxLag = Math.round(fps * 1.5);  // longest plausible stride ~40 spm
+    const hiLag = Math.min(maxLag, ac.length - 1);
     let bestLag = minLag, bestAC = -Infinity;
-    for (let lag = minLag; lag <= Math.min(maxLag, ac.length - 1); lag++) {
+    for (let lag = minLag; lag <= hiLag; lag++) {
       if (ac[lag] > bestAC) { bestAC = ac[lag]; bestLag = lag; }
     }
-    const spmAuto = bestLag > 0 ? (fps / bestLag) * 60 * 2 : 0;
+    // Parabolic (3-point) interpolation of the autocorr peak -> sub-sample lag.
+    // Integer lags quantize cadence (e.g. ~189.5 vs 200 SPM across the lag boundary),
+    // so the same clip can jump between runs; the refined lag smooths that out.
+    // Skip at the search-window edges where a 3-point fit isn't defined.
+    let refinedLag = bestLag;
+    if (bestLag > minLag && bestLag < hiLag) {
+      const am1 = ac[bestLag - 1], a0 = ac[bestLag], ap1 = ac[bestLag + 1];
+      const denom = am1 - 2 * a0 + ap1;
+      let delta = denom !== 0 ? 0.5 * (am1 - ap1) / denom : 0;
+      delta = Math.max(-1, Math.min(1, delta));
+      refinedLag = bestLag + delta;
+    }
+    const spmAuto = refinedLag > 0 ? (fps / refinedLag) * 60 * 2 : 0;
 
     // 8. Choose method — cross-validate peak detection against autocorrelation
     //    to catch double-counting (spurious peaks => spmPeak ~2x the true cadence).
@@ -619,6 +632,32 @@
       const r = CadenceCore.computeSPM(t.samples);
       const ok = Math.abs(r.spm - t.expect) <= t.tol;
       console.log(`${ok ? 'PASS' : 'FAIL'} Test${t.label}: got ${r.spm} expected ${t.expect}±${t.tol} method=${r.method} conf=${r.confidence}`);
+    }
+
+    // --- Autocorr sub-sample (parabolic) interpolation ---
+    // A cadence whose true lag falls BETWEEN two integers must not snap to either.
+    // period=18.5 frames -> 194.6 SPM (between lag18=200 and lag19=189.5); the refined
+    // lag should land on the true value (integer-only autocorr is ~5 SPM off here).
+    // A genuine ~190 case must also stay ~190 -> adjacent lags both read correctly.
+    {
+      function pureAnkle(n, fps, periodFrames) {
+        const lA = [], rA = [], lV = [], rV = [], ts = [];
+        for (let i = 0; i < n; i++) {
+          const ph = 2 * Math.PI * i / periodFrames;
+          lA.push(0.8 + 0.05 * Math.cos(ph));
+          rA.push(0.8 + 0.05 * Math.cos(ph + Math.PI));
+          lV.push(1); rV.push(1); ts.push(i / fps * 1000);
+        }
+        return { leftAnkleY: lA, rightAnkleY: rA, hipMidY: new Array(n).fill(0.5), leftVis: lV, rightVis: rV, tMs: ts };
+      }
+      const fps = 30;
+      const trueMid = (fps / 18.5) * 120;                                   // 194.6
+      const rMid = CadenceCore.computeSPM(pureAnkle(300, fps, 18.5));
+      const r190 = CadenceCore.computeSPM(pureAnkle(300, fps, 3600 / 190)); // period 18.947 -> 190
+      const okMid = Math.abs(rMid.debug.spmAuto - trueMid) <= 2;
+      const ok190 = Math.abs(r190.debug.spmAuto - 190) <= 2;
+      const ok = okMid && ok190;
+      console.log(`${ok ? 'PASS' : 'FAIL'} AC-interp: between-lag=${Math.round(rMid.debug.spmAuto * 10) / 10}(exp≈${Math.round(trueMid * 10) / 10}) ~190=${Math.round(r190.debug.spmAuto * 10) / 10}`);
     }
 
     // --- Overstride tests ---
